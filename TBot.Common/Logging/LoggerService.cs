@@ -24,6 +24,24 @@ using System.Globalization;
 using Microsoft.AspNetCore.Routing.Template;
 
 namespace TBot.Common.Logging {
+
+	// LoggerService<T> is registered as an open-generic singleton, so each closed type (LoggerService<Program>,
+	// LoggerService<TelegramMessenger>, etc) gets its OWN copy of any ` static` field declared inside it - a classic
+	// generic-static-per-closed-type gotcha. All the state below is meant to describe ONE global logging pipeline
+	// (mirroring Serilog.Log.Logger, which really is process-global), so it lives in this non-generic holder instead.
+	public static class LoggerServiceSharedState {
+		public static readonly object SyncObject = new object();
+		public static string LogPath = "";
+		public static readonly LoggingLevelSwitch TelegramLevelSwitch = new LoggingLevelSwitch(LogEventLevel.Verbose);
+		public static bool TelegramAdded = false;
+		// Mirrors TBot.Ogame.Infrastructure.Models.LogPrivacy.HideAccountInfo (can't reference it
+		// directly here - TBot.Common doesn't depend on TBot.Ogame.Infrastructure). Set from
+		// TBotMain alongside the other LogPrivacy flags. When true, log timestamps drop to
+		// date-only instead of full HH:mm:ss.fff, so exact activity times aren't exposed in
+		// shared logs/screenshots.
+		public static bool HideTimestampPrecision = false;
+	}
+
 	public class LoggerService<T> : ILoggerService<T> {
 
 		private readonly IHubContext<WebHub, IWebHub> _hub;
@@ -35,16 +53,11 @@ namespace TBot.Common.Logging {
 			_serviceProvider = serviceProvider;
 		}
 
-		private object syncObject = new object();
-		private static string _logPath = "";
-
-		private LoggingLevelSwitch _telegramLevelSwitch = new LoggingLevelSwitch(LogEventLevel.Verbose);
-		private bool _telegramAdded = false;
 
 		public void WriteLog(LogLevel level, LogSender sender, string message) {
 			IDisposable? telegram = null;
 
-			if (_telegramAdded == true) {
+			if (LoggerServiceSharedState.TelegramAdded == true && sender != LogSender.OGameD) {
 				telegram = LogContext.PushProperty("TelegramEnabled", true);
 			}
 			using (LogContext.PushProperty("LogSender", sender))
@@ -80,7 +93,11 @@ namespace TBot.Common.Logging {
 		}
 
 		private LoggerConfiguration GetDefaultConfiguration() {
-			string outTemplate = "[{Timestamp:HH:mm:ss.fff zzz} {ThreadId} {Level:u3} {LogSender}] {Message:lj}{NewLine}{Exception}";
+			// Full precision by default; date-only when HideTimestampPrecision is set, so shared
+			// logs/screenshots don't reveal exact activity times (hour/minute/second).
+			string timestampToken = LoggerServiceSharedState.HideTimestampPrecision ? "{Timestamp:yyyy-MM-dd}" : "{Timestamp:HH:mm:ss.fff zzz}";
+			string outTemplate = $"[{timestampToken} {{ThreadId}} {{Level:u3}} {{LogSender}}] {{Message:lj}}{{NewLine}}{{Exception}}";
+			string fileTemplate = $"{timestampToken} [{{Level:u3}}] {{Message:lj}}{{NewLine}}{{Exception}}";
 			long maxFileSize = 1 * 1024 * 1024 * 10;
 
 			var logConfig = new LoggerConfiguration()
@@ -92,20 +109,22 @@ namespace TBot.Common.Logging {
 				)
 				// Log file
 				.WriteTo.File(
-					path: Path.Combine(_logPath, "TBot.log"),
+					path: Path.Combine(LoggerServiceSharedState.LogPath, "TBot.log"),
+					outputTemplate: fileTemplate,
 					buffered: false,
-					flushToDiskInterval: TimeSpan.FromHours(1),
+					shared: true,
+					flushToDiskInterval: TimeSpan.FromSeconds(1),
 					rollOnFileSizeLimit: true,
 					fileSizeLimitBytes: maxFileSize,
 					retainedFileCountLimit: 10,
 					rollingInterval: RollingInterval.Day)
 				// CSV
 				.WriteTo.File(
-					path: Path.Combine(_logPath, "TBot.csv"),
+					path: Path.Combine(LoggerServiceSharedState.LogPath, "TBot.csv"),
 					buffered: false,
 					hooks: new SerilogCSVHeaderHooks(),
 					formatter: new SerilogCSVTextFormatter(),
-					flushToDiskInterval: TimeSpan.FromHours(1),
+					flushToDiskInterval: TimeSpan.FromSeconds(1),
 					rollOnFileSizeLimit: true,
 					fileSizeLimitBytes: maxFileSize,
 					rollingInterval: RollingInterval.Day)
@@ -123,57 +142,75 @@ namespace TBot.Common.Logging {
 		}
 
 		public void ConfigureLogging(string logPath) {
-			lock (syncObject) {
-				_logPath = logPath;
+			lock (LoggerServiceSharedState.SyncObject) {
+				LoggerServiceSharedState.LogPath = logPath;
 
 				var logConfig = GetDefaultConfiguration();
 
 				// Telegram default values
-				_telegramLevelSwitch.MinimumLevel = LogEventLevel.Verbose;
-				_telegramAdded = false;
+				LoggerServiceSharedState.TelegramLevelSwitch.MinimumLevel = LogEventLevel.Verbose;
+				LoggerServiceSharedState.TelegramAdded = false;
 
+				(Log.Logger as IDisposable)?.Dispose();
 				Log.Logger = logConfig.CreateLogger();
 
 			}
 		}
 
 		public void AddTelegramLogger(string botToken, string chatId) {
-			lock (syncObject) {
-				if (_telegramAdded == false) {
+			lock (LoggerServiceSharedState.SyncObject) {
+				if (LoggerServiceSharedState.TelegramAdded == false) {
+					var previousLogger = Log.Logger;
+
+					// Building the Telegram sink can block on a synchronous network call to the
+					// Telegram API (bot/chat validation). If that call hangs due to network
+					// flakiness, it must not be allowed to freeze the whole instance startup -
+					// bound it with a timeout and fall back to logging without Telegram.
+				var buildTask = Task.Run(() => {
 					var logConfig = GetDefaultConfiguration();
-					Log.Logger = logConfig.WriteTo.Logger(
-							c => c.Filter.Equals(Matching.WithProperty<bool>("TelegramEnabled", p => p == true))
-							).WriteTo.Telegram(botToken: botToken,
+					return logConfig.WriteTo.Logger(
+							c => c.Filter.ByIncludingOnly(Matching.WithProperty<bool>("TelegramEnabled", p => p == true))
+							.MinimumLevel.ControlledBy(LoggerServiceSharedState.TelegramLevelSwitch)
+							.WriteTo.Telegram(botToken: botToken,
 								chatId: chatId,
 								dateFormat: null,
 								outputTemplate: "{LogLevelEmoji:l}{LogSenderEmoji:l} {Message:lj}{NewLine}{Exception}")
+						)
 						.CreateLogger();
+				});
 
-					_telegramAdded = true;
+					if (buildTask.Wait(TimeSpan.FromSeconds(15))) {
+						Serilog.ILogger newLogger = buildTask.Result;
+						(previousLogger as IDisposable)?.Dispose();
+						Log.Logger = newLogger;
+						LoggerServiceSharedState.TelegramAdded = true;
+					} else {
+						previousLogger.Warning("Timed out initializing the Telegram logger (Telegram API unreachable/slow) - continuing without Telegram logging");
+					}
 				}
 			}
 		}
 
 		public void RemoveTelegramLogger() {
-			ConfigureLogging(_logPath);
+			ConfigureLogging(LoggerServiceSharedState.LogPath);
 		}
 
 		public bool IsTelegramLoggerEnabled() {
-			return _telegramAdded;
+			return LoggerServiceSharedState.TelegramAdded;
 		}
 
 		public void SetTelegramLoggerLogLevel(LogEventLevel logLevel) {
-			lock (syncObject) {
-				if (logLevel != _telegramLevelSwitch.MinimumLevel) {
-					WriteLog(LogLevel.Warning, LogSender.Main, $"Telegram log level changed from {_telegramLevelSwitch.MinimumLevel.ToString()}" +
+			lock (LoggerServiceSharedState.SyncObject) {
+				if (logLevel != LoggerServiceSharedState.TelegramLevelSwitch.MinimumLevel) {
+					WriteLog(LogLevel.Warning, LogSender.Main, $"Telegram log level changed from {LoggerServiceSharedState.TelegramLevelSwitch.MinimumLevel.ToString()}" +
 						$" into {logLevel.ToString()}");
 				}
-				_telegramLevelSwitch.MinimumLevel = logLevel;
+				LoggerServiceSharedState.TelegramLevelSwitch.MinimumLevel = logLevel;
 			}
 		}
 
 		public LogEventLevel GetTelegramLoggerLevel() {
-			return _telegramLevelSwitch.MinimumLevel;
+			return LoggerServiceSharedState.TelegramLevelSwitch.MinimumLevel;
 		}
 	}
 }

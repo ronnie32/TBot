@@ -1,4 +1,14 @@
-# Changelog
+# TBot (fork Outgrow1827) — Changelog
+
+Log of changes in our fork. History below v3.5.0-beta4 is inherited from `ronnie32/TBot`'s `fix/ogame-v13-tbot-3.4.7` branch (the base this fork now builds on); the `[Unreleased]` section at the top lists fixes made in this fork that aren't in that upstream history yet.
+
+## [Unreleased] — post-3.5.0-beta5 (Outgrow1827 fork)
+
+- **fix**: deposit-building priority (`CalculationService.GetNextDepositToBuild`) picked Deuterium first every time due to a fixed check order, so Metal Storage never got built even when it was the most urgent one. Now computes each eligible resource's relative deficit (`needed`/`capacity`) and picks whichever is furthest behind its own `DepositHours` target.
+- **fix**: AutoFarm's `MinimumPlayerRank` filter (`IsTargetInMinimumRank`) silently defaulted to rank 1 (always passes the filter) when the target was a moon whose sibling planet wasn't in the current scan. Now falls back to the persistent `FarmTargetCache`'s last known player name, then resolves a fresh rank via a new `HighscorePlayerRankCache` (fetches/caches `api/highscore.xml`, category=1/type=0) before giving up.
+- **chore**: `autofarm_*.db` (`FarmTargetCache`) and `players_db_*.json` (`PlayersDatabase`) moved into a `data/` subfolder next to `instance_settings.json`, instead of sitting loose in the deploy folder's root.
+- **chore**: reordered `General.SlotPriorityLevel` keys in the template (`Brain, Expeditions, AutoFarm, AutoHarvest, AutoColonize, AutoDiscovery`) — no functional effect, just consistency.
+- **fix**: `ColonizeWorker`'s static `_galaxyScanCache` (galaxy-occupancy lookup cache added in 3.4.7) only ever overwrote stale entries, never removed them, so a wide `AutoColonize.Targets` range left it growing for the whole process lifetime. `GetGalaxyInfoCached` now actively evicts a stale entry on read instead of leaving it in place, and a 1000-entry hard cap drops the oldest entries if hit, bounding worst-case memory regardless of how wide the configured scan range is.
 
 ## v3.5.0-beta4
 
@@ -192,3 +202,27 @@
 - TBot unit tests pass.
 - ogame bridge tests pass.
 - AutoFarm was exercised against a real OGame v13 account: the first empty-system scan created a persistent cache, and the next cycle skipped that system without rescanning or sending a fleet.
+
+## v3.4.7 (Outgrow1827 fork details)
+
+More detailed record of what this fork itself changed for the v3.4.7 release, ahead of and independent from `ronnie32`'s own v3.4.7 entry above.
+
+### Fixed
+- **Log-privacy leaks** — `TelegramMessenger.AddTbotInstance`/`RemoveTBotInstance` had their own unguarded player/server name interpolation bypassing `LogPrivacy`, same as `ExpeditionsWorker`'s `[EXP DEBUG]` lines (now routed through `Coordinate.ToString()`, which already masks). `GetCelestials()`'s `AddRange` calls null-guarded — was throwing on every cycle while logged out instead of logging one meaningful warning.
+- **`AutoDiscovery` cursor stuck at position 15 when blacklisted** — `resumeNextPos` was only advanced on the successful-send path; the blacklisted-position `continue` left it unchanged, so a blacklisted position 15 made the cursor retry the same position forever instead of moving on.
+- **Forced HTTPS redirect breaking the HTTP-only local WebUI** — `UseHttpsRedirection()`/`UseHsts()` were 307-redirecting every visit of a WebUI that's only ever served over plain HTTP, to a scheme nothing listens on.
+- **`AutoDefence` production-based calculation restored** (lost in the 3.4.6 rebase) — port of Vesselin Bontchev's Optimal Defense calculator, gated by `Brain.AutoDefence.UseProductionBasedCalculation`. Also restores the `Facilities` fetch `CalcProductionTime` needs (missing = crash) and one-build-order-per-cycle behavior.
+- **Self-contained single-file publish config restored**; AutoFarm poll spam fixed; `SlotPriorityLevel.Colonize` renamed back to `AutoColonize`.
+- **Log/CSV files writing to exe root instead of `log/` folder** — root cause: `LoggerService<T>` is an open-generic singleton, so static/instance fields declared inside it (`_logPath`, `syncObject`, `_telegramLevelSwitch`, `_telegramAdded`) weren't shared the way they looked like they should be; `Program.cs`'s `logPath` now uses `AppContext.BaseDirectory` instead of the fragile `Directory.GetCurrentDirectory()`, matching the pattern already used for `settingsPath`.
+
+### Added
+- **`DefenderWorker` counter-espionage** — `NotifySpyWatch` sends a Telegram alert when someone spies us; `SpyBackAtOrigin` counter-spies the attacker's origin plus every other coordinate recorded for that player (`PlayersDatabase`), each cooldown-limited. Needed `InstanceSettingsPath` made public on `ITBotMain`/`TBotMain` to load the per-instance players DB, and `Coordinate.ToRawString()`/`TryParse()` for privacy-safe persistence.
+- **AutoFarm combat-simulation target vetting and defense-probing rework** — new `TryGetAcceptableCombatFleet`/`EstimateDebrisField`/`GetAcceptableFleetLossPercentage` reject farm targets whose predicted loss ratio or loot/risk ratio is unacceptable (`AcceptableFleetLossPercentage`/`MinLootToRiskRatio`). Also reworks the defense-probing flow (send 1 probe as an attack to detect otherwise-undetectable defenses) into a tracked, cached `DefenseProbing` state.
+- **Crash self-relaunch** (`TryRelaunchSelfAfterCrash`), replacing the removed `TBot.Watchdog.exe` process — `AppDomain.UnhandledException`/`TaskScheduler.UnobservedTaskException` handlers log the crash, kill the orphaned `ogamed.exe` child, and relaunch a fresh instance of the same `TBot.exe` with the same args, capped at 5 restarts per 10 minutes to avoid a crash loop. New `--no-crash-restart` flag disables it. Runs entirely in-process, no separate executable involved.
+- **`AutoColonize` empty-system targeting, exclude filters, and galaxy-scan cache** — new per-target `TargetEmptySystems`/`EmptySystemsBuffer`/`ExcludeSystems` fields, a top-level `AutoColonize.Exclude` global filter, retry+backoff on `GetGalaxyInfo`, and an in-memory 1h galaxy-scan cache so the same systems aren't re-scanned every cycle.
+- **`BrainTransportCoordinator` lock-wait bound** — `ResourceDecisionLock` previously had no timeout, so a stuck network call inside one Brain worker's locked section could block the other 3 indefinitely (matches an observed console freeze). Also: new `BrainTransportCoordinator` shares `Brain.Transports.MaxSlots` across the 4 active Brain items instead of each reading it as its own full budget, and serializes their `Execute()` via a semaphore to stop concurrent double-spend of the same origin celestial's resources; new opt-in `Brain.Transports.StockpileForRoundTrip` sizes a transport to cover every construction that would sequentially run during the fleet's round trip; `AutoFleetJumpGate` pairing fix.
+- **New settings**: `ManualModeTimeout`, `Watchdog`, config keys for AutoDefence/AutoFarm/AutoColonize/Defender (`SpyWatch` section, `SpyAttacker.CooldownMinutes`/`MaxKnownCoordinates`, etc. — the repo template was missing several keys the code already read).
+
+### Infrastructure
+- **Ported from `net9.0` to `net10.0`** — `TargetFramework` updated across all 4 projects (TBot, TBot.Common, TBot.Ogame.Infrastructure, TBot.WebUI). Removed our own `Extensions.Shuffle<T>` (`OrderBy(rnd.Next())`) — .NET 10 added a native `Enumerable.Shuffle` to LINQ with the same purpose, which made every call site ambiguous (`CS0121`); all callers now use the native, unbiased Fisher-Yates implementation.
+- **Build documentation** for Windows and Linux — proper step-by-step for both OSes: installing the .NET 10 SDK (`winget` on Windows, `apt` on Linux), and building/placing `ogamed.exe` first (this fork's daemon must be built from the `ogame` repo's own source, not downloaded from upstream's release page — was previously undocumented, and the old text incorrectly said to grab it from an official release). Both build commands verified end-to-end, including the Linux-specific path.

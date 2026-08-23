@@ -21,6 +21,7 @@ namespace TBot.Common.Logging {
 		LifeformsAutoMine,
 		LifeformsAutoResearch,
 		AutoFleetJumpGate,
+		AutoFleepJumpGate,
 		//End Brain Features
 		Expeditions,
 		Harvest,
@@ -29,6 +30,7 @@ namespace TBot.Common.Logging {
 		Colonize,
 		AutoFarm,
 		AutoDiscovery,
-		Telegram
+		Telegram,
+		Watchdog
 	}
 }

@@ -46,6 +46,17 @@ namespace Tbot.Services {
 		private Dictionary<string, Timer> timers = new();
 		private ConcurrentDictionary<Feature, ITBotWorker> workers = new();
 		private CancellationTokenSource cts = new();
+		private string _telegramSolverBotToken = "";
+		private long _telegramSolverChatId = 0;
+
+		public IEnumerable<Tbot.Workers.ITBotWorker> GetAllWorkers() {
+			foreach (var w in workers.Values) {
+				yield return w;
+				foreach (var cw in w.celestialWorkers.Values) {
+					yield return cw;
+				}
+			}
+		}
 
 
 		public UserData userData = new();
@@ -57,7 +68,7 @@ namespace Tbot.Services {
 		public event EventHandler OnError;
 
 		public dynamic InstanceSettings { get; private set; }
-		private string InstanceSettingsPath { get; set; }
+		public string InstanceSettingsPath { get; private set; }
 		public string InstanceAlias { get; private set; }
 		public UserData UserData {
 			set {
@@ -190,14 +201,28 @@ namespace Tbot.Services {
 			}
 
 
-			_ogameService.Initialize(GetCredentialsFromSettings(), GetDeviceFromSettings(), proxy, (string) host, int.Parse(port), (string) captchaKey);
+			bool hideAccountNameInLogs = false;
+			try {
+				hideAccountNameInLogs = SettingsService.IsSettingSet(InstanceSettings.General, "HideSensitiveDataInLogs") && (bool) InstanceSettings.General.HideSensitiveDataInLogs;
+			} catch { }
+			TBot.Ogame.Infrastructure.Models.LogPrivacy.HideCoordinates = hideAccountNameInLogs;
+			TBot.Ogame.Infrastructure.Models.LogPrivacy.HideAccountInfo = hideAccountNameInLogs;
+			LoggerServiceSharedState.HideTimestampPrecision = hideAccountNameInLogs;
+
+			int manualModeTimeout = 30;
+			try {
+				if (SettingsService.IsSettingSet(InstanceSettings.General, "ManualModeTimeout"))
+					manualModeTimeout = (int) InstanceSettings.General.ManualModeTimeout;
+			} catch { }
+
+			_ogameService.Initialize(GetCredentialsFromSettings(), GetDeviceFromSettings(), proxy, (string) host, int.Parse(port), (string) captchaKey, hideAccountNameInLogs, _telegramSolverBotToken, _telegramSolverChatId, manualModeTimeout);
 			await Task.Delay(RandomizeHelper.CalcRandomInterval(IntervalType.AFewSeconds));
 		}
 
 		private async Task ResolveCaptcha() {
 
 			var captchaChallenge = await _ogameService.GetCaptchaChallenge();
-			if (captchaChallenge.Id.Length == 0) {
+			if (string.IsNullOrEmpty(captchaChallenge.Id)) {
 				log(LogLevel.Warning, LogSender.Tbot, "No captcha found. Unable to login.");
 				log(LogLevel.Warning, LogSender.Tbot, "Please check your credentials, language and universe name.");
 				log(LogLevel.Warning, LogSender.Tbot, "If your credentials are correct try refreshing your IP address.");
@@ -223,24 +248,32 @@ namespace Tbot.Services {
 
 			var serverTime = await _tbotOgameBridge.GetDateTime();
 
+			if (LogPrivacy.HideAccountInfo) {
+				_ogameService.PlayerNameForLogs = userData.userInfo.PlayerName;
+			}
+
 			log(LogLevel.Information, LogSender.Tbot, $"Server time: {serverTime.ToString()}");
-			log(LogLevel.Information, LogSender.Tbot, $"Player name: {userData.userInfo.PlayerName}");
-			log(LogLevel.Information, LogSender.Tbot, $"Player class: {userData.userInfo.Class.ToString()}");
-			log(LogLevel.Information, LogSender.Tbot, $"Alliance class: {userData.allianceClass.ToString()}");
-			log(LogLevel.Information, LogSender.Tbot, $"Player rank: {userData.userInfo.Rank}");
-			log(LogLevel.Information, LogSender.Tbot, $"Player points: {userData.userInfo.Points}");
-			log(LogLevel.Information, LogSender.Tbot, $"Player honour points: {userData.userInfo.HonourPoints}");
+			log(LogLevel.Information, LogSender.Tbot, $"Player name: {(LogPrivacy.HideAccountInfo ? "Player Name" : userData.userInfo.PlayerName)}");
+			log(LogLevel.Information, LogSender.Tbot, $"Player class: {(LogPrivacy.HideAccountInfo ? "***" : userData.userInfo.Class.ToString())}");
+			log(LogLevel.Information, LogSender.Tbot, $"Alliance class: {(LogPrivacy.HideAccountInfo ? "***" : userData.allianceClass.ToString())}");
+			log(LogLevel.Information, LogSender.Tbot, $"Player rank: {(LogPrivacy.HideAccountInfo ? "***" : userData.userInfo.Rank.ToString())}");
+			log(LogLevel.Information, LogSender.Tbot, $"Player points: {(LogPrivacy.HideAccountInfo ? "***" : userData.userInfo.Points.ToString())}");
+			log(LogLevel.Information, LogSender.Tbot, $"Player honour points: {(LogPrivacy.HideAccountInfo ? "***" : userData.userInfo.HonourPoints.ToString())}");
 		}
 
 		public async Task Init(string settingPath,
 			string alias,
-			ITelegramMessenger telegramHandler) {
+			ITelegramMessenger telegramHandler,
+			string telegramSolverBotToken = "",
+			long telegramSolverChatId = 0) {
 
 			InstanceSettingsPath = settingPath;
 			InstanceAlias = alias;
 			InstanceSettings = await SettingsService.GetSettings(settingPath);
 
 			telegramMessenger = telegramHandler;
+			_telegramSolverBotToken = telegramSolverBotToken;
+			_telegramSolverChatId = telegramSolverChatId;
 			try {
 				await InitializeOgame();
 			} catch (Exception e) {
@@ -294,6 +327,7 @@ namespace Tbot.Services {
 			userData.researches = await _tbotOgameBridge.UpdateResearches();
 			userData.scheduledFleets = new();
 			userData.farmTargets = new();
+			userData.runningProfiles = new();
 
 			if (userData.celestials.Count == 1) {
 				await EditSettings(userData.celestials.First());
@@ -359,6 +393,8 @@ namespace Tbot.Services {
 		}
 
 		public override string ToString() {
+			if (LogPrivacy.HideAccountInfo)
+				return "Player Name@Server Name";
 			if (loggedIn && (userData.userInfo != null) && (userData.serverData != null))
 				return $"{userData.userInfo.PlayerName}@{userData.serverData.Name}";
 			else
@@ -554,10 +590,17 @@ namespace Tbot.Services {
 				await HandleSleepModeAsync(null);
 				_lastReloadFinished = DateTime.Now;
 			}
+			catch (Exception e) {
+				// This is async void (required by the SettingsFileWatcher callback signature) - any
+				// exception that escapes here has no caller to observe it and crashes the whole
+				// process instead of just failing this one reload. Absorb and log instead.
+				log(LogLevel.Error, LogSender.Tbot, $"OnSettingsChanged exception: {e.Message}");
+				log(LogLevel.Warning, LogSender.Tbot, $"Stacktrace: {e.StackTrace}");
+			}
 			finally {
 				_settingsReloadSemaphore.Release();
 			}
-			
+
 		}
 		public async Task ListProfiles() {
 			string profilesDir = Path.Combine(Path.GetDirectoryName(InstanceSettingsPath), "profiles");
@@ -971,8 +1014,16 @@ namespace Tbot.Services {
 			}
 		}
 
-		public void TelegramCollect(bool noLimit = false) {
-			_fleetScheduler.Collect(noLimit);
+		public void TelegramCollect(bool noLimit = false, string celestialType = null) {
+			if (!string.IsNullOrEmpty(celestialType)) {
+				if (!Enum.TryParse(celestialType, true, out Celestials celestialTypeEnum)) {
+					SendTelegramMessage($"Invalid celestial type: {celestialType}. Valid types are: Planet, Moon. Or just /collect");
+					return;
+				}
+				_fleetScheduler.Collect(noLimit, celestialTypeEnum);
+			} else {
+				_fleetScheduler.Collect(noLimit);
+			}
 			return;
 		}
 

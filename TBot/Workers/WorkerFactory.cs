@@ -55,6 +55,7 @@ namespace Tbot.Workers {
 				Feature.BrainLifeformAutoResearch => new LifeformsAutoResearchWorker(tbotMainInstance, _ogameService, _fleetScheduler, _calculationService, tbotOgameBridge, this),
 				Feature.AutoDiscovery => new AutoDiscoveryWorker(tbotMainInstance, _ogameService, _fleetScheduler, _calculationService, tbotOgameBridge),
 				Feature.BrainAutoFleetJumpGate => new AutoFleetJumpGateWorker(tbotMainInstance, _ogameService, tbotOgameBridge),
+				Feature.Watchdog => new WatchdogWorker(tbotMainInstance),
 				_ => null
 			};
 

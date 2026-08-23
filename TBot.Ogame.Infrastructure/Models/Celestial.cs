@@ -32,7 +32,8 @@ namespace TBot.Ogame.Infrastructure.Models {
 		public Researches Researches { get; set; }
 
 		public override string ToString() {
-			return $"{Name} {Coordinate.ToString()}";
+			string name = LogPrivacy.HideAccountInfo ? "Planet Name" : Name;
+			return $"{name} {Coordinate.ToString()}";
 		}
 
 		public bool HasProduction() {

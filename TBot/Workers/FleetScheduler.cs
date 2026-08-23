@@ -1247,8 +1247,8 @@ if (
 			}
 		}
 
-		public async Task Collect(bool noLimit = false) {
-			await CollectImpl(true, noLimit);
+		public async Task Collect(bool noLimit = false, Celestials specificCelestialType = Celestials.None) {
+			await CollectImpl(true, noLimit, specificCelestialType);
 		}
 
 		public async Task CollectDeut(long MinAmount = 0) {
@@ -1334,7 +1334,7 @@ if (
 			}
 		}
 
-		public async Task<RepatriateCode> CollectImpl(bool fromTelegram, bool noLimit = false) {
+		public async Task<RepatriateCode> CollectImpl(bool fromTelegram, bool noLimit = false, Celestials specificCelestialType = Celestials.None) {
 			try {
 				_tbotInstance.log(LogLevel.Information, LogSender.FleetScheduler, "Repatriating resources...");
 
@@ -1362,6 +1362,9 @@ if (
 					celestialList = (bool) _tbotInstance.InstanceSettings.Brain.AutoRepatriate.RandomOrder ? celestialList.Shuffle().ToList() : celestialList.ToList();
 					
 					foreach (Celestial celestial in celestialList) {
+						if (specificCelestialType != Celestials.None && celestial.Coordinate.Type != specificCelestialType) {
+							continue;
+						}
 						List<Celestial> closestCelestials = tempCelestials
 							.OrderBy(c => _calcService.CalcDistance(c.Coordinate, celestial.Coordinate, _tbotInstance.UserData.serverData)).ToList();
 						Coordinate destinationCoordinate = new();

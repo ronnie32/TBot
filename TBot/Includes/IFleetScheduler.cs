@@ -20,8 +20,8 @@ namespace Tbot.Includes {
 		void RetireFleet(object fleet);
 		Task<int> HandleMinerTransport(Celestial origin, Celestial destination, Celestial differentDestination, Resources resources, Buildables buildable = Buildables.Null, Buildings maxBuildings = null, Facilities maxFacilities = null, Facilities maxLunarFacilities = null, AutoMinerSettings autoMinerSettings = null);
 		Task<int> HandleMinerTransport(Celestial origin, Celestial destination, Celestial differentDestination, Resources resources, LFBuildables buildable = LFBuildables.None, LFBuildings maxLFBuildings = null, bool preventIfMoreExpensiveThanNextMine = false);
-		Task Collect(bool noLimit = false);
-		Task<RepatriateCode> CollectImpl(bool fromTelegram = false, bool noLimit = false);
+		Task Collect(bool noLimit = false, Celestials specificCelestialType = Celestials.None);
+		Task<RepatriateCode> CollectImpl(bool fromTelegram = false, bool noLimit = false, Celestials specificCelestialType = Celestials.None);
 		Task CollectDeut(long minAmount = 0);
 	}
 }

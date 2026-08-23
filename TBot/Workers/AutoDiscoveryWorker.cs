@@ -14,6 +14,7 @@ using TBot.Model;
 using TBot.Ogame.Infrastructure;
 using TBot.Ogame.Infrastructure.Enums;
 using TBot.Ogame.Infrastructure.Models;
+using Tbot.Common.Settings;
 
 namespace Tbot.Workers {
 	public class AutoDiscoveryWorker : WorkerBase {
@@ -173,6 +174,15 @@ namespace Tbot.Workers {
 
 			if (origin?.Coordinate == null) return discoveries;
 			if (discoveries <= 0 || ctx.FleetsToSend <= 0 || ctx.Stop) return discoveries;
+
+			if (SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoDiscovery, "PauseWhenArtifactsAbove") && (bool) _tbotInstance.InstanceSettings.AutoDiscovery.PauseWhenArtifactsAbove) {
+				const long ArtifactsStorageCap = 3600;
+				var artifacts = await _ogameService.GetArtifacts(origin);
+				if (artifacts.Collected >= ArtifactsStorageCap) {
+					DoLog(LogLevel.Information, $"Pausing: artifacts storage is at {artifacts.Collected}/{artifacts.Max}, at or above the {ArtifactsStorageCap} cap.");
+					return discoveries;
+				}
+			}
 
 			DateTime now = await _tbotOgameBridge.GetDateTime();
 			int systemToDo = cursor.System;
@@ -334,7 +344,7 @@ namespace Tbot.Workers {
 						(int)_tbotInstance.InstanceSettings.AutoFarm.MaxSlots,
 						(int)_tbotInstance.UserData.fleets.Count(f => f.Mission == Missions.Attack)
 					),
-					new RankSlotsPriority(Feature.Colonize, (int)_tbotInstance.InstanceSettings.General.SlotPriorityLevel.Colonize,
+					new RankSlotsPriority(Feature.Colonize, (int)_tbotInstance.InstanceSettings.General.SlotPriorityLevel.AutoColonize,
 						(bool)_tbotInstance.InstanceSettings.AutoColonize.Active,
 						(bool)_tbotInstance.InstanceSettings.AutoColonize.IntensiveResearch.Active ? (int)_tbotInstance.InstanceSettings.AutoColonize.IntensiveResearch.MaxSlots : 1,
 						(int)_tbotInstance.UserData.fleets.Count(f => f.Mission == Missions.Colonize)

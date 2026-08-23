@@ -23,6 +23,7 @@ namespace TBot.Ogame.Infrastructure.Enums {
 			Feature.Colonize,
 			Feature.Harvest,
 			Feature.SleepMode,
+			Feature.Watchdog,
 		};
 	}
 }

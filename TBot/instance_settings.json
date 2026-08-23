@@ -26,6 +26,8 @@
 	"General": {
 		"Host": "localhost",
 		"Port": "8080",
+		"ManualModeTimeout": 30,
+		"HideSensitiveDataInLogs": false,
 		"Proxy": {
 			"Enabled": false,
 			"Address": "",
@@ -51,6 +53,7 @@
 		"GoToSleep": "23:15",
 		"WakeUp": "07:05",
 		"PreventIfThereAreFleets": true,
+		"LogoutOnSleep": false,
 		"TelegramMessenger": {
 			"Active": false
 		},
@@ -84,6 +87,8 @@
 		},
 		"Autofleet": {
 			"Active": true,
+			"DelayFleetSaveIfImpactOccurLaterThanNextCheck": true,
+			"MaxDelayMinutes": 30,
 			"TelegramMessenger": {
 				"Active": false
 			}
@@ -96,7 +101,14 @@
 		],
 		"SpyAttacker": {
 			"Active": true,
-			"Probes": 20
+			"Probes": 20,
+			"SpyAllKnownCoordinates": true,
+			"CooldownMinutes": 60,
+			"MaxKnownCoordinates": 5
+		},
+		"SpyWatch": {
+			"Active": false,
+			"CooldownMinutes": 30
 		},
 		"MessageAttacker": {
 			"Active": false,
@@ -120,6 +132,7 @@
 			"CargoType": "SmallCargo",
 			"DeutToLeaveOnMoons": 1000000,
 			"RoundResources": true,
+			"RoundTo": 1000,
 			"SendToTheMoonIfPossible": false,
 			"Origin": {
 				"Galaxy": 3,
@@ -130,6 +143,7 @@
 			"MaxSlots": 10,
 			"CheckMoonOrPlanetFirst": false,
 			"DoMultipleTransportIsNotEnoughShipButSamePosition": false,
+			"StockpileForRoundTrip": false,
 			"MultipleOrigins": {
 				"Active": false,
 				"OnlyFromMoons": true,
@@ -244,7 +258,14 @@
             "MaxTechs34": 0,
             "MaxTechs35": 0,
             "MaxTechs36": 0,
-            "Exclude": [],
+            "Exclude": [
+                {
+                    "Galaxy": 1,
+                    "System": 1,
+                    "Position": 1,
+                    "Type": "Planet"
+                }
+            ],
             "CheckIntervalMin": 60,
             "CheckIntervalMax": 120
         },
@@ -308,13 +329,20 @@
 			"Active": false,
 			"ExcludeMoons": true,
 			"RandomOrder": true,
+			"UseProductionBasedCalculation": false,
+			"ProductionCoverageHours": 24,
+			"MaxConstructionMinutes": 60,
 			"DefenceToReach": {
 				"RocketLauncher": 100000,
 				"HeavyLaser": 10000,
 				"GaussCannon": 1000,
+				"IonCannon": 1000,
 				"PlasmaTurret": 1000,
 				"SmallShieldDome": true,
-				"LargeShieldDome": true
+				"LargeShieldDome": true,
+				"LightLaser": 0,
+				"AntiBallisticMissiles": 0,
+				"InterplanetaryMissiles": 0
 			},
 			"Exclude": [
 				{
@@ -347,7 +375,14 @@
 			"CargoType": "LargeCargo",
 			"RandomOrder": false,
 			"SkipIfIncomingTransport": true,
-			"Exclude": [],
+			"Exclude": [
+				{
+					"Galaxy": 1,
+					"System": 1,
+					"Position": 1,
+					"Type": "Planet"
+				}
+			],
 			"CheckIntervalMin": 3000,
 			"CheckIntervalMax": 6000
 		},
@@ -436,6 +471,28 @@
 	"AutoFarm": {
 		"Active": false,
 		"ExcludeMoons": true,
+		"AcceptableFleetLossPercentage": 0,
+		"MinLootToRiskRatio": 1.0,
+		"FastFarmMode": false,
+		"FastFarmMaxCacheAge": 1440,
+		"ProbeAttackForDefenseCheck": false,
+		"Ships": {
+			"LightFighter": false,
+			"HeavyFighter": false,
+			"Cruiser": false,
+			"Battleship": false,
+			"Battlecruiser": false,
+			"Bomber": false,
+			"Destroyer": false,
+			"Deathstar": false,
+			"SmallCargo": false,
+			"LargeCargo": false,
+			"ColonyShip": false,
+			"Recycler": false,
+			"EspionageProbe": false,
+			"Reaper": false,
+			"Pathfinder": false
+		},
 		"ScanRange": [
 			{
 				"Galaxy": 5,
@@ -507,6 +564,13 @@
 			"Type": "Planet"
 		},
 		"SlotsToLeaveFree": 0,
+		"Exclude": [
+			{
+				"Galaxy": 1,
+				"System": 1,
+				"Position": 1
+			}
+		],
 		"Abandon": {
 			"Active": true,
 			"MinFields": 280,
@@ -526,7 +590,11 @@
 				"EndSystem": 123,
 				"StartPosition": 7,
 				"EndPosition": 9,
-				"MaxPlanets": 1
+				"MaxPlanets": 1,
+				"TargetEmptySystems": false,
+				"EmptySystemsBuffer": 0,
+				"IgnoreInactivePlayers": false,
+				"ExcludeSystems": []
 			},
 			{
 				"Galaxy": 3,
@@ -534,7 +602,11 @@
 				"EndSystem": 350,
 				"StartPosition": 15,
 				"EndPosition": 15,
-				"MaxPlanets": 2
+				"MaxPlanets": 2,
+				"TargetEmptySystems": false,
+				"EmptySystemsBuffer": 0,
+				"IgnoreInactivePlayers": false,
+				"ExcludeSystems": []
 			}
 		],
 		"RandomPosition": false,
@@ -554,7 +626,14 @@
 		"MaxSlots": 5,
 		"MaxFailures": 5,
 		"RandomizeDestination": false,
+		"PauseWhenArtifactsAbove": false,
 		"CheckIntervalMin": 30,
 		"CheckIntervalMax": 60
+	},
+	"Watchdog": {
+		"Active": false,
+		"MaxStuckMinutes": 30,
+		"CheckIntervalMin": 5,
+		"CheckIntervalMax": 10
 	}
 }

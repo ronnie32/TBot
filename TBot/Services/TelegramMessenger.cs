@@ -130,7 +130,7 @@ namespace Tbot.Services {
 
 		public async Task AddTbotInstance(TBotMain instance, ITBotOgamedBridge tbotOgamedBridge) {
 			_logger.WriteLog(LogLevel.Information, LogSender.Telegram, "Adding instance.....");
-			_logger.WriteLog(LogLevel.Information, LogSender.Telegram, $"[{instance.userData.userInfo.PlayerName}@{instance.userData.serverData.Name}]");
+			_logger.WriteLog(LogLevel.Information, LogSender.Telegram, LogPrivacy.HideAccountInfo ? "[Player Name@Server Name]" : $"[{instance.userData.userInfo.PlayerName}@{instance.userData.serverData.Name}]");
 
 			await instanceSem.WaitAsync(ct);
 
@@ -151,12 +151,12 @@ namespace Tbot.Services {
 
 		public async Task RemoveTBotInstance(TBotMain instance) {
 			_logger.WriteLog(LogLevel.Information, LogSender.Telegram, "Removing instance.....");
-			_logger.WriteLog(LogLevel.Information, LogSender.Telegram, $"[{instance.userData.userInfo.PlayerName}@{instance.userData.serverData.Name}]");
+			_logger.WriteLog(LogLevel.Information, LogSender.Telegram, LogPrivacy.HideAccountInfo ? "[Player Name@Server Name]" : $"[{instance.userData.userInfo.PlayerName}@{instance.userData.serverData.Name}]");
 
 			await instanceSem.WaitAsync(ct);
 			var instanceToRemove = instances.FirstOrDefault(i => i.Instance.InstanceAlias == instance.InstanceAlias);
 			if (instanceToRemove == null || !instances.Remove(instanceToRemove)) {
-				_logger.WriteLog(LogLevel.Information, LogSender.Telegram, $"Error removing [{instance.userData.userInfo.PlayerName}@{instance.userData.serverData.Name}]");
+				_logger.WriteLog(LogLevel.Information, LogSender.Telegram, LogPrivacy.HideAccountInfo ? "Error removing [Player Name@Server Name]" : $"Error removing [{instance.userData.userInfo.PlayerName}@{instance.userData.serverData.Name}]");
 			}
 
 			instanceSem.Release();
@@ -422,7 +422,7 @@ namespace Tbot.Services {
 								"/ghostsleep - Wait fleets return, ghost harvest for current celestial only, and sleep for 5hours <code>/ghostsleep 4h3m or 3m50s Harvest</code>\n" +
 								"/ghostsleepall - Wait fleets return, ghost harvest for all celestial and sleep for 5hours <code>/ghostsleepall 4h3m or 3m50s Harvest</code>\n" +
 								"/ghost - Ghost for the specified amount of hours on the specified mission. Format: <code>/ghost 4h3m or 3m50s Harvest</code>\n" +
-								"/ghostmoons - Ghost moons fleet for the specified amount of hours on the specified mission. Format: <code>/ghostto 4h30m Harvest</code>\n" +
+								"/ghostmoons - Ghost moons fleet for the specified amount of hours on the specified mission. Format: <code>/ghostmoons 4h30m Harvest</code>\n" +
 								"/switch - Switch current celestial resources and fleets to its planet or moon at the specified speed. Format: <code>/switch 5</code>\n" +
 								"/deploy - Deploy to celestial with full ships and resources. Format: <code>/deploy 3:41:9 moon/planet 10</code>\n" +
 								"/jumpgate - jumpgate to moon with full ships [full], or keeps needed cargo amount for resources [auto]. Format: <code>/jumpgate 2:41:9 auto/full</code>\n" +
@@ -437,6 +437,7 @@ namespace Tbot.Services {
 								"/msg - Send a message to current attacker. Format: <code>/msg hello dude</code>\n" +
 								"/sleep - Stop bot for the specified amount of hours. Format: <code>/sleep 4h3m or 3m50s</code>\n" +
 								"/wakeup - Wakeup bot\n" +
+								"/clearcache - Clear FastFarm target cache for current instance\n" +
 								"/cancel - Cancel fleet with specified ID. Format: <code>/cancel 65656</code>\n" +
 								"/cancelmission - Cancel all fleets with specified mission. Format: <code>/cancel Deploy</code> or other mission\n" +
 								"/getcelestials - Return the list of your celestials\n" +
@@ -462,7 +463,6 @@ namespace Tbot.Services {
 								"/stopautodiscovery - stop autodiscovery\n" +
 								"/startautodiscovery - start autodiscovery\n" +
 								"/fleetjumpgate - run jump gate worker immediately\n" +
-								"/startautodiscovery - start autodiscovery\n" +
 								"/profile - able to load one or multiple profiles. Format: <code>/profile ls/ls-r/reset/laod [profilename] [profilenameX] </code>\n"
 							, ParseMode.Html);
 							return;
@@ -868,6 +868,15 @@ namespace Tbot.Services {
 								currInstance.WakeUpNow(null);
 								return;
 
+							case "/clearcache":
+								if (message.Text.Split(' ').Length != 1) {
+									await SendMessage(botClient, message.Chat, "No argument accepted with this command!");
+									return;
+								}
+								bool cleared = await FarmTargetCache.ClearTargetCache(currInstance.InstanceSettingsPath, currInstance.InstanceAlias);
+								await SendMessage(botClient, message.Chat, cleared ? "FastFarm target cache cleared." : "No cache to clear.");
+								return;
+
 
 							case "/msg":
 								if (message.Text.Split(' ').Length < 2) {
@@ -919,8 +928,12 @@ namespace Tbot.Services {
 
 
 							case "/collect":
-								if (message.Text.Split(' ').Length != 1) {
+								if (message.Text.Split(' ').Length > 2) {
 									await SendMessage(botClient, message.Chat, "No argument accepted with this command!");
+									return;
+								}
+								if (message.Text.Split(' ').Length == 2) {
+									currInstance.TelegramCollect(false, message.Text.Split(' ')[1]);
 									return;
 								}
 
@@ -929,8 +942,12 @@ namespace Tbot.Services {
 
 
 							case "/collectall":
-								if (message.Text.Split(' ').Length != 1) {
+								if (message.Text.Split(' ').Length > 2) {
 									await SendMessage(botClient, message.Chat, "No argument accepted with this command!");
+									return;
+								}
+								if (message.Text.Split(' ').Length == 2) {
+									currInstance.TelegramCollect(true, message.Text.Split(' ')[1]);
 									return;
 								}
 

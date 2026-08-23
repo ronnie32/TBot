@@ -127,7 +127,12 @@ namespace Tbot.Includes {
 					if (_cts != null) {
 						_cts.Cancel();
 					}
-					await _scheduledAction;
+					try {
+						await _scheduledAction;
+					} catch (OperationCanceledException) {
+						// Expected - _cts.Cancel() above is what makes the scheduled action observe
+						// cancellation and throw here. Not an error, just how the stop signal propagates.
+					}
 					_cts = null;
 					_scheduledAction = null;
 				}

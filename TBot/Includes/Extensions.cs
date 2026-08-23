@@ -7,11 +7,6 @@ using TBot.Ogame.Infrastructure.Models;
 
 namespace Tbot.Includes {
 	public static class Extensions {
-		public static IEnumerable<T> Shuffle<T>(this IEnumerable<T> source) {
-			Random rnd = new();
-			return source.OrderBy((item) => rnd.Next());
-		}
-
 		public static bool Has(this List<Celestial> celestials, Celestial celestial) {
 			foreach (Celestial cel in celestials) {
 				if (cel.HasCoords(celestial.Coordinate)) {

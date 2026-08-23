@@ -139,6 +139,19 @@ namespace Tbot.Workers {
 		public abstract Feature GetFeature();
 		public abstract LogSender GetLogSender();
 
+		public DateTime? LastExecutionStart { get; private set; }
+		public DateTime? LastExecutionEnd { get; private set; }
+
+		// Watchdog needs to keep ticking even while the bot is "sleeping" - every other worker
+		// intentionally pauses then, but a hang can happen at any time and sleep periods can last hours.
+		protected virtual bool RunsDuringSleep => false;
+
+		// Workers that check very frequently (e.g. Watchdog, every 1-2 min) can set this to false
+		// so the "Next X execution in..." line doesn't dominate the log - most workers check every
+		// 10-60+ min and the line is genuinely useful there. Not a log-level knob because every
+		// sink here is configured at Verbose, so a lower level wouldn't actually get filtered out.
+		protected virtual bool LogNextExecution => true;
+
 
 
 		protected Task EndExecution() {
@@ -152,7 +165,7 @@ namespace Tbot.Workers {
 
 		private async Task ExecutionWrapper(CancellationToken ct) {
 
-			if (_tbotInstance.UserData.isSleeping == true) {
+			if (_tbotInstance.UserData.isSleeping == true && !RunsDuringSleep) {
 				DoLog(LogLevel.Debug, $"Sleeping... Ending {GetWorkerName()}");
 				await EndExecution();
 				return;
@@ -167,10 +180,14 @@ namespace Tbot.Workers {
 
 				ct.ThrowIfCancellationRequested();
 
+				LastExecutionStart = DateTime.UtcNow;
 				await Execute();
+				LastExecutionEnd = DateTime.UtcNow;
 
 				if (Period != Timeout.InfiniteTimeSpan) {
-					DoLog(LogLevel.Information, $"Next {GetWorkerName()} execution in {Period}");
+					if (LogNextExecution) {
+						DoLog(LogLevel.Information, $"Next {GetWorkerName()} execution in {Period}");
+					}
 				}
 				else {
 					DoLog(LogLevel.Information, $"{GetWorkerName()} Stopped.");

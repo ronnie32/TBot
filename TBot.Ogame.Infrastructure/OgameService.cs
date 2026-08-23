@@ -29,12 +29,15 @@ namespace TBot.Ogame.Infrastructure {
 		private HttpClient _client;
 		private Process? _ogamedProcess;
 		private string _username;
+		private bool _hideAccountNameInLogs;
 
 		private Credentials _credentials;
 		private Device _device;
 		private string _host;
 		private int _port;
 		private string _captchaKey;
+		private string _telegramSolverBotToken;
+		private long _telegramSolverChatId;
 		private ProxySettings _proxySettings;
 		private string _cookiesPath;
 
@@ -51,17 +54,24 @@ namespace TBot.Ogame.Infrastructure {
 				ProxySettings proxySettings,
 				string host = "127.0.0.1",
 				int port = 8080,
-				string captchaKey = "") {
+				string captchaKey = "",
+				bool hideAccountNameInLogs = false,
+				string telegramSolverBotToken = "",
+				long telegramSolverChatId = 0,
+				int manualModeTimeout = 30) {
 			_credentials = credentials;
 			_device = device;
 			_host = host;
 			_port = port;
 			_captchaKey = captchaKey;
+			_telegramSolverBotToken = telegramSolverBotToken;
+			_telegramSolverChatId = telegramSolverChatId;
 			_proxySettings = proxySettings;
+			_hideAccountNameInLogs = hideAccountNameInLogs;
 
 			_username = credentials.Username;
 
-			_ogamedProcess = ExecuteOgamedExecutable(credentials, device, host, port, captchaKey, proxySettings);
+			_ogamedProcess = ExecuteOgamedExecutable(credentials, device, host, port, captchaKey, proxySettings, telegramSolverBotToken, telegramSolverChatId, manualModeTimeout);
 
 			_client = new HttpClient() {
 				BaseAddress = new Uri($"http://{host}:{port}/"),
@@ -103,20 +113,33 @@ namespace TBot.Ogame.Infrastructure {
 			return (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) ? "ogamed.exe" : "ogamed";
 		}
 
-		internal Process ExecuteOgamedExecutable(Credentials credentials, Device device, string host = "localhost", int port = 8080, string captchaKey = "", ProxySettings proxySettings = null) {
+		internal Process ExecuteOgamedExecutable(Credentials credentials, Device device, string host = "localhost", int port = 8080, string captchaKey = "", ProxySettings proxySettings = null, string telegramSolverBotToken = "", long telegramSolverChatId = 0, int manualModeTimeout = 30) {
 			Process? ogameProc = null;
 			try {
-				string args = $"--universe=\"{credentials.Universe}\" --username={credentials.Username} --password={credentials.Password} --device-name={device.Name} --language={credentials.Language} --auto-login=false --port={port} --host=0.0.0.0";
+				// Pass credentials via environment variables, not CLI args, since process arguments
+				// are visible to any other process/user on the machine.
+				var envVars = new System.Collections.Generic.Dictionary<string, string> {
+					["OGAMED_USERNAME"] = credentials.Username,
+					["OGAMED_PASSWORD"] = credentials.Password,
+				};
+
+				string args = $"--universe=\"{credentials.Universe}\" --device-name={device.Name} --language={credentials.Language} --auto-login=false --port={port} --host=0.0.0.0 --manual-mode-timeout={manualModeTimeout}";
+				if (_hideAccountNameInLogs)
+					args += " --hide-account-info-in-logs=true";
 				if (captchaKey != "")
 					args += $" --nja-api-key={captchaKey}";
+				if (telegramSolverBotToken != "" && telegramSolverChatId != 0) {
+					envVars["OGAMED_TELEGRAM_SOLVER_BOT_TOKEN"] = telegramSolverBotToken;
+					args += $" --telegram-solver-chat-id={telegramSolverChatId}";
+				}
 				if (proxySettings.Enabled) {
 					if (proxySettings.Type == "socks5" || proxySettings.Type == "http") {
 						args += $" --proxy={proxySettings.Address}";
 						args += $" --proxy-type={proxySettings.Type}";
 						if (proxySettings.Username != "")
-							args += $" --proxy-username={proxySettings.Username}";
+							envVars["OGAMED_PROXY_USERNAME"] = proxySettings.Username;
 						if (proxySettings.Password != "")
-							args += $" --proxy-password={proxySettings.Password}";
+							envVars["OGAMED_PROXY_PASSWORD"] = proxySettings.Password;
 						if (proxySettings.LoginOnly)
 							args += " --proxy-login-only=true";
 					}
@@ -124,8 +147,8 @@ namespace TBot.Ogame.Infrastructure {
 				if (credentials.IsLobbyPioneers)
 					args += " --lobby=lobby-pioneers";
 				if (credentials.BasicAuthUsername != "" && credentials.BasicAuthPassword != "") {
-					args += $" --basic-auth-username={credentials.BasicAuthUsername}";
-					args += $" --basic-auth-password={credentials.BasicAuthPassword}";
+					envVars["OGAMED_AUTH_USERNAME"] = credentials.BasicAuthUsername;
+					envVars["OGAMED_AUTH_PASSWORD"] = credentials.BasicAuthPassword;
 				}
 
 				if (device.System != "") {
@@ -162,6 +185,9 @@ namespace TBot.Ogame.Infrastructure {
 				ogameProc = new Process();
 				ogameProc.StartInfo.FileName = GetExecutableName();
 				ogameProc.StartInfo.Arguments = args;
+				foreach (var kv in envVars) {
+					ogameProc.StartInfo.Environment[kv.Key] = kv.Value;
+				}
 				ogameProc.EnableRaisingEvents = true;
 				ogameProc.StartInfo.RedirectStandardOutput = true;
 				ogameProc.StartInfo.RedirectStandardError = true;
@@ -193,8 +219,22 @@ namespace TBot.Ogame.Infrastructure {
 				dump_ogamedProcess_Log(false, e.Data);
 		}
 
+		// Set by TBotMain once the player name is known (after login), so ogamed's own debug
+		// output can be scrubbed too - OgameService itself never learns the player's display name.
+		public string PlayerNameForLogs { get; set; } = "";
+
 		private void dump_ogamedProcess_Log(bool isErr, string? payload) {
-			_logger.WriteLog(isErr ? LogLevel.Error : LogLevel.Information, LogSender.OGameD, $"[{_username}] \"{payload}\"");
+			string label = _hideAccountNameInLogs ? "user_mail@player.com" : _username;
+			if (_hideAccountNameInLogs && payload != null) {
+				if (!string.IsNullOrEmpty(_credentials?.Universe)) {
+					payload = System.Text.RegularExpressions.Regex.Replace(payload, System.Text.RegularExpressions.Regex.Escape(_credentials.Universe), "Server Name", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+				}
+				if (!string.IsNullOrEmpty(PlayerNameForLogs)) {
+					payload = System.Text.RegularExpressions.Regex.Replace(payload, System.Text.RegularExpressions.Regex.Escape(PlayerNameForLogs), "Player Name", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+				}
+				payload = System.Text.RegularExpressions.Regex.Replace(payload, @"Players online: \d+, Players: \d+", "Players online: ***, Players: ***");
+			}
+			_logger.WriteLog(isErr ? LogLevel.Error : LogLevel.Information, LogSender.OGameD, $"[{label}] \"{payload}\"");
 		}
 
 		private void handle_ogamedProcess_Exited(object? sender, EventArgs e) {
@@ -352,6 +392,28 @@ namespace TBot.Ogame.Infrastructure {
 
 		public async Task<string> GetServerUrl() {
 			return await GetAsync<string>("/bot/server-url");
+		}
+
+		// Raw XML passthrough of OGame's public /api/highscore.xml, proxied by ogamed (category: 1=Player,
+		// 2=Alliance; type: 0=Total, 1=Economy, 2=Research, 3=Military, 4=Military Lost, 5=Military Built,
+		// 6=Military Destroyed, 7=Honor). Bypasses GetAsync/ManageResponse since this endpoint returns raw
+		// XML, not ogamed's usual {status, message, result} JSON envelope.
+		public async Task<string> GetHighscoreXml(int category, int type) {
+			var response = await GetRetryPolicy()
+				.ExecuteAsync(async () => await _client.GetAsync($"api/highscore.xml?category={category}&type={type}"));
+			response.EnsureSuccessStatusCode();
+			return await response.Content.ReadAsStringAsync();
+		}
+
+		// Raw XML passthrough of OGame's public /api/players.xml, proxied by ogamed. Gives each
+		// player's status string (a: admin, v: vacation, i: inactive, I: long inactive, b: banned,
+		// o: outlaw/strong player, combinable eg. "vI") - finer-grained than what a galaxy scan alone
+		// exposes (Planet.Inactive collapses i/I into a single flag).
+		public async Task<string> GetPlayersXml() {
+			var response = await GetRetryPolicy()
+				.ExecuteAsync(async () => await _client.GetAsync("api/players.xml"));
+			response.EnsureSuccessStatusCode();
+			return await response.Content.ReadAsStringAsync();
 		}
 
 		public async Task<string> GetServerLanguage() {
@@ -714,8 +776,10 @@ namespace TBot.Ogame.Infrastructure {
 			var planets = await GetPlanets();
 			var moons = await GetMoons();
 			List<Celestial> celestials = new();
-			celestials.AddRange(planets);
-			celestials.AddRange(moons);
+			if (planets != null)
+				celestials.AddRange(planets);
+			if (moons != null)
+				celestials.AddRange(moons);
 			return celestials;
 		}
 
@@ -755,6 +819,14 @@ namespace TBot.Ogame.Infrastructure {
 
 		public async Task<ArtifactInventory> GetArtifactInventory(Celestial celestial) {
 			return await GetAsync<ArtifactInventory>($"/bot/planets/{celestial.ID}/artifacts");
+		}
+
+		public async Task<LFBonuses> GetLFBonuses(Celestial celestial) {
+			return await GetAsync<LFBonuses>($"/bot/planets/{celestial.ID}/lifeform-bonuses");
+		}
+
+		public async Task<ArtifactsInfo> GetArtifacts(Celestial celestial) {
+			return await GetAsync<ArtifactsInfo>($"/bot/planets/{celestial.ID}/artifacts");
 		}
 
 		public async Task<Facilities> GetFacilities(Celestial celestial) {

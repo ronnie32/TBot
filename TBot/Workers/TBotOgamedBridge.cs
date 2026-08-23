@@ -64,7 +64,7 @@ namespace Tbot.Workers
 						planet.LFTechs = await ogameService.GetLFTechs(planet);
 						break;
 					case UpdateTypes.LFBonuses:
-						planet.LFBonuses = await ogameService.GetLFBonuses();
+						planet.LFBonuses = await ogameService.GetLFBonuses(planet);
 						break;
 					case UpdateTypes.Ships:
 						planet.Ships = await ogameService.GetShips(planet);

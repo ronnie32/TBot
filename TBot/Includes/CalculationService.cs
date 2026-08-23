@@ -929,6 +929,56 @@ namespace Tbot.Includes {
 			return hourlyProduction;
 		}
 
+		// Port of Vesselin Bontchev's "Optimal Defense" calculator. Only covers
+		// RocketLauncher/LightLaser/HeavyLaser/GaussCannon/PlasmaTurret - AntiBallisticMissiles and
+		// the shield domes always come from the manual DefenceToReach setting regardless of this,
+		// same as the original. See project memory/HISTORICO for the full derivation; re-ported
+		// 2026-08-05 after being lost in the 3.4.6 rebase.
+		public Defences CalcNeededDefenceFromProduction(Planet celestial, Researches researches, ServerData serverData, int coverageHours, CharacterClass playerClass = CharacterClass.NoClass, bool hasGeologist = false, bool hasStaff = false) {
+			Resources hourlyProduction = CalcPlanetHourlyProduction(celestial, serverData.Speed, 1, researches, playerClass, hasGeologist, hasStaff);
+
+			// Fusion Reactor deuterium consumption isn't accounted for in CalcDeuteriumProduction -
+			// subtract it separately, capped so production never goes negative.
+			if (celestial.Buildings.FusionReactor > 0) {
+				long fusionConsumption = (long) Math.Round(10 * celestial.Buildings.FusionReactor * Math.Pow(1.1, celestial.Buildings.FusionReactor), 0, MidpointRounding.ToPositiveInfinity);
+				hourlyProduction.Deuterium = Math.Max(0, hourlyProduction.Deuterium - fusionConsumption);
+			}
+
+			long productionOverPeriod = (hourlyProduction.Metal + hourlyProduction.Crystal + hourlyProduction.Deuterium) * coverageHours;
+			long currentStock = celestial.Resources.Metal + celestial.Resources.Crystal + celestial.Resources.Deuterium;
+
+			// Debris value of the fleet currently sitting idle on this celestial - only a fraction
+			// of a destroyed ship's cost survives as debris (ServerData.DebrisFactor).
+			long fleetCost = 0;
+			foreach (Buildables shipType in Enum.GetValues<Buildables>()) {
+				long amount = celestial.Ships.GetAmount(shipType);
+				if (amount <= 0)
+					continue;
+				Resources unitCost = CalcPrice(shipType, 1);
+				fleetCost += (unitCost.Metal + unitCost.Crystal) * amount;
+			}
+			long fleetDebrisValue = (long) (fleetCost * serverData.DebrisFactor);
+
+			const float lootPercent = 75f;
+			double debrisPct = serverData.DebrisFactorDef * 100;
+			double totalLoot = fleetDebrisValue + (productionOverPeriod + currentStock) * (lootPercent / 100.0);
+
+			double neededPT = Math.Ceiling(5.0658556 * totalLoot * (70.0 / (100.0 - debrisPct)) / 100000.0);
+			double neededGC = Math.Max(0, Math.Ceiling(totalLoot / (10000.0 * (100.0 - debrisPct) / 100.0) - neededPT));
+			double neededHL = Math.Max(0, Math.Ceiling((totalLoot / (4000.0 * (100.0 - debrisPct) / 100.0) - neededPT - neededGC) / 0.6));
+			double neededRLLL = Math.Max(0, Math.Ceiling(totalLoot / (1000.0 * (100.0 - debrisPct) / 100.0) - neededPT - neededGC - neededHL));
+			long neededRL = (long) Math.Ceiling(neededRLLL * 2.0 / 3.0);
+			long neededLL = (long) Math.Ceiling(neededRLLL / 3.0);
+
+			return new Defences(
+				rocketlauncher: neededRL,
+				lightlaser: neededLL,
+				heavylaser: (long) neededHL,
+				gausscannon: (long) neededGC,
+				plasmaturret: (long) neededPT
+			);
+		}
+
 		public Resources CalcPrice(Buildables buildable, int level, LFBonuses lfBonuses = null) {
 			Resources output = new();
 
@@ -3139,7 +3189,7 @@ namespace Tbot.Includes {
 		}
 
 		public long CalcDepositCapacity(int level) {
-			return 5000 * (long) (2.5 * Math.Pow(Math.E, (20 * level / 33)));
+			return 5000 * (long) (2.5 * Math.Pow(Math.E, (20.0 * level / 33.0)));
 		}
 
 		public bool ShouldBuildMetalStorage(Planet planet, int maxLevel, int speedFactor, int hours = 12, float ratio = 1, Researches researches = null, CharacterClass playerClass = CharacterClass.NoClass, bool hasGeologist = false, bool hasStaff = false, bool forceIfFull = false) {
@@ -4108,10 +4158,32 @@ namespace Tbot.Includes {
 			return nextLFtech;
 		}
 
+		// True when a resource is already sitting at/above its storage cap right now - production is
+		// being wasted every cycle it stays this way, unlike negative energy (which the game throttles
+		// down automatically, a reversible loss, not a destructive one).
+		private bool IsStorageOverflowing(Planet planet) {
+			// Resources/Buildings can be null here if a prior update for this planet was skipped
+			// (eg. a network timeout mid-cycle - "An error has occurred with update Buildings.
+			// Skipping update" - leaves the celestial's cached data incomplete but the caller still
+			// proceeds to GetNextBuildingToBuild with it). Treat unknown as "not overflowing" rather
+			// than crash the whole AutoMine cycle for this celestial.
+			if (planet.Resources == null || planet.Buildings == null)
+				return false;
+			return planet.Resources.Metal >= CalcDepositCapacity(planet.Buildings.MetalStorage)
+				|| planet.Resources.Crystal >= CalcDepositCapacity(planet.Buildings.CrystalStorage)
+				|| planet.Resources.Deuterium >= CalcDepositCapacity(planet.Buildings.DeuteriumTank);
+		}
+
 		public Buildables GetNextBuildingToBuild(Planet planet, Researches researches, Buildings maxBuildings, Facilities maxFacilities, CharacterClass playerClass, Staff staff, ServerData serverData, AutoMinerSettings settings, float ratio = 1) {
 			Buildables buildableToBuild = Buildables.Null;
 			if (ShouldBuildTerraformer(planet, researches, maxFacilities.Terraformer))
 				buildableToBuild = Buildables.Terraformer;
+			// Storage overflow happening right now takes priority over a negative-energy fix: a stalled
+			// energy source (eg. waiting on resources, or capped by MaxSolarPlant/MaxFusionReactor)
+			// would otherwise starve the deposit indefinitely below while resources keep being wasted
+			// past the cap every cycle. See project memory 2026-08-08.
+			if (buildableToBuild == Buildables.Null && IsStorageOverflowing(planet))
+				buildableToBuild = GetNextDepositToBuild(planet, researches, maxBuildings, playerClass, staff, serverData, settings, ratio);
 			if (buildableToBuild == Buildables.Null && ShouldBuildEnergySource(planet))
 				buildableToBuild = GetNextEnergySourceToBuild(planet, maxBuildings.SolarPlant, maxBuildings.FusionReactor, settings.BuildSolarSatellites);
 			if (buildableToBuild == Buildables.Null)
@@ -4140,12 +4212,33 @@ namespace Tbot.Includes {
 				planet.Facilities.ResearchLab < 5
 			)
 				return depositToBuild;
-			if (depositToBuild == Buildables.Null && ShouldBuildDeuteriumTank(planet, maxBuildings.DeuteriumTank, serverData.Speed, settings.DepositHours, ratio, researches, playerClass, staff.Geologist, staff.IsFull, settings.BuildDepositIfFull))
-				depositToBuild = Buildables.DeuteriumTank;
-			if (depositToBuild == Buildables.Null && ShouldBuildCrystalStorage(planet, maxBuildings.CrystalStorage, serverData.Speed, settings.DepositHours, ratio, researches, playerClass, staff.Geologist, staff.IsFull, settings.BuildDepositIfFull))
-				depositToBuild = Buildables.CrystalStorage;
-			if (depositToBuild == Buildables.Null && ShouldBuildMetalStorage(planet, maxBuildings.MetalStorage, serverData.Speed, settings.DepositHours, ratio, researches, playerClass, staff.Geologist, staff.IsFull, settings.BuildDepositIfFull))
-				depositToBuild = Buildables.MetalStorage;
+			// Pick whichever eligible deposit is relatively furthest behind its own DepositHours target
+			// (needed/capacity ratio), not a fixed Deuterium > Crystal > Metal order - a fixed order lets
+			// whichever resource is checked first (Deuterium, then Crystal) keep re-triggering forever
+			// and starve the ones checked later (confirmed: Crystal kept winning, Metal never got picked
+			// despite being the highest producer - see project memory 2026-08-08).
+			float bestRatio = 0;
+			if (ShouldBuildDeuteriumTank(planet, maxBuildings.DeuteriumTank, serverData.Speed, settings.DepositHours, ratio, researches, playerClass, staff.Geologist, staff.IsFull, settings.BuildDepositIfFull)) {
+				float r = (float) (settings.DepositHours * CalcDeuteriumProduction(planet, serverData.Speed, ratio, researches, playerClass, staff.Geologist, staff.IsFull)) / Math.Max(1, CalcDepositCapacity(planet.Buildings.DeuteriumTank));
+				if (r > bestRatio) {
+					bestRatio = r;
+					depositToBuild = Buildables.DeuteriumTank;
+				}
+			}
+			if (ShouldBuildCrystalStorage(planet, maxBuildings.CrystalStorage, serverData.Speed, settings.DepositHours, ratio, researches, playerClass, staff.Geologist, staff.IsFull, settings.BuildDepositIfFull)) {
+				float r = (float) (settings.DepositHours * CalcCrystalProduction(planet, serverData.Speed, ratio, researches, playerClass, staff.Geologist, staff.IsFull)) / Math.Max(1, CalcDepositCapacity(planet.Buildings.CrystalStorage));
+				if (r > bestRatio) {
+					bestRatio = r;
+					depositToBuild = Buildables.CrystalStorage;
+				}
+			}
+			if (ShouldBuildMetalStorage(planet, maxBuildings.MetalStorage, serverData.Speed, settings.DepositHours, ratio, researches, playerClass, staff.Geologist, staff.IsFull, settings.BuildDepositIfFull)) {
+				float r = (float) (settings.DepositHours * CalcMetalProduction(planet, serverData.Speed, ratio, researches, playerClass, staff.Geologist, staff.IsFull)) / Math.Max(1, CalcDepositCapacity(planet.Buildings.MetalStorage));
+				if (r > bestRatio) {
+					bestRatio = r;
+					depositToBuild = Buildables.MetalStorage;
+				}
+			}
 
 			return depositToBuild;
 		}
@@ -4949,7 +5042,15 @@ namespace Tbot.Includes {
 					.Where(c => c.Resources.TotalResources > 0)
 					.ToList();
 
-			closestCelestials = transportSettings.MultipleOrigin.PriorityToProximityOverQuantity ? 
+			Resources TotalResources = closestCelestials.Aggregate(new Resources(), (total, celestial) => total.Sum(celestial.Resources.Difference(new Resources(0, 0, transportSettings.DeutToLeave))) );
+			if (!TotalResources.IsEnoughFor(missingResources)) {
+				_logger.WriteLog(LogLevel.Information, LogSender.Brain, $"Not enough resources available on all celestials: Needed: {missingResources.TransportableResources} - Available: {TotalResources.TransportableResources}");
+				return new();
+			} else {
+				_logger.WriteLog(LogLevel.Information, LogSender.Brain, $"Enough resources available on all celestials: Needed: {missingResources.TransportableResources} - Available: {TotalResources.TransportableResources}");
+			}
+
+			closestCelestials = transportSettings.MultipleOrigin.PriorityToProximityOverQuantity ?
 				closestCelestials.OrderBy(c => CalcDistance(c.Coordinate, celestialToBuild.Coordinate, userData.serverData)).ToList() :
 				closestCelestials.OrderByDescending(c => c.Resources.TotalResources).ToList();
 
@@ -4963,7 +5064,7 @@ namespace Tbot.Includes {
 							Celestials.Moon
 						)
 					));
-				var destinationResources = roundRes ? destination.Resources.Round() : destination.Resources;
+				var destinationResources = roundRes ? destination.Resources.Round(transportSettings.RoundTo) : destination.Resources;
 				if (destinationResources.IsEnoughFor(missingResources)) {
 					if (destination.Ships.GetAmount(transportSettings.CargoType) >= CalcShipNumberForPayload(missingResources, transportSettings.CargoType, userData.researches.HyperspaceTechnology, userData.serverData, destination.LFBonuses.GetShipCargoBonus(transportSettings.CargoType), userData.userInfo.Class, userData.serverData.ProbeCargo)) {
 						result.Add(new Dictionary<Celestial, Resources> { { destination, missingResources } } );

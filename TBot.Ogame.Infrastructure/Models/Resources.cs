@@ -103,9 +103,9 @@ namespace TBot.Ogame.Infrastructure.Models {
 
 		public Resources Round(int roundTo = 1000) {
 			Resources output = new();
-			output.Metal = (long) Math.Round((double) ((double) Metal / (double) roundTo), 0, MidpointRounding.ToPositiveInfinity) * (long) 1000;
-			output.Crystal = (long) Math.Round((double) ((double) Crystal / (double) roundTo), 0, MidpointRounding.ToPositiveInfinity) * (long) 1000;
-			output.Deuterium = (long) Math.Round((double) ((double) Deuterium / (double) roundTo), 0, MidpointRounding.ToPositiveInfinity) * (long) 1000;
+			output.Metal = (long) Math.Round((double) ((double) Metal / (double) roundTo), 0, MidpointRounding.ToPositiveInfinity) * (long) roundTo;
+			output.Crystal = (long) Math.Round((double) ((double) Crystal / (double) roundTo), 0, MidpointRounding.ToPositiveInfinity) * (long) roundTo;
+			output.Deuterium = (long) Math.Round((double) ((double) Deuterium / (double) roundTo), 0, MidpointRounding.ToPositiveInfinity) * (long) roundTo;
 			return output;
 		}
 

@@ -147,6 +147,9 @@ namespace Tbot.Workers {
 		public abstract Feature GetFeature();
 		public abstract LogSender GetLogSender();
 
+		public DateTime? LastExecutionStart { get; private set; }
+		public DateTime? LastExecutionEnd { get; private set; }
+
 
 
 		protected Task EndExecution() {
@@ -176,7 +179,9 @@ namespace Tbot.Workers {
 
 				ct.ThrowIfCancellationRequested();
 
+				LastExecutionStart = DateTime.UtcNow;
 				await Execute();
+				LastExecutionEnd = DateTime.UtcNow;
 
 				if (Period != Timeout.InfiniteTimeSpan) {
 					DoLog(LogLevel.Information, $"Next {GetWorkerName()} execution in {Period}");

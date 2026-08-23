@@ -92,14 +92,24 @@ namespace Tbot.Workers.Brain {
 						neededCargos = (long) Math.Round((float) difference / (float) oneShipCapacity, MidpointRounding.ToPositiveInfinity);
 						DoLog(LogLevel.Information, $"{difference.ToString("N0")} more capacity is needed, {neededCargos} more {preferredCargoShip.ToString()} are needed.");
 					} else {
-						neededCargos = (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToKeep - tempCelestial.Ships.GetAmount(preferredCargoShip);
+						long awayCargoShips = _tbotInstance.UserData.fleets
+							.Where(f => f.Mission != Missions.Deploy && f.Mission != Missions.Colonize)
+							.Where(f => f.Origin != null && f.Origin.IsSame(tempCelestial.Coordinate))
+							.Sum(f => f.Ships?.GetAmount(preferredCargoShip) ?? 0);
+						long ownedCargoShips = tempCelestial.Ships.GetAmount(preferredCargoShip) + awayCargoShips;
+						neededCargos = (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToKeep - ownedCargoShips;
 					}
 					if (neededCargos > 0) {
 						if (neededCargos > (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToBuild)
 							neededCargos = (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToBuild;
 
-					if (tempCelestial.Ships.GetAmount(preferredCargoShip) + neededCargos > (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToKeep)
-						neededCargos = (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToKeep - tempCelestial.Ships.GetAmount(preferredCargoShip);
+					long awayCargoShips2 = _tbotInstance.UserData.fleets
+						.Where(f => f.Mission != Missions.Deploy && f.Mission != Missions.Colonize)
+						.Where(f => f.Origin != null && f.Origin.IsSame(tempCelestial.Coordinate))
+						.Sum(f => f.Ships?.GetAmount(preferredCargoShip) ?? 0);
+					long ownedCargoShips2 = tempCelestial.Ships.GetAmount(preferredCargoShip) + awayCargoShips2;
+					if (ownedCargoShips2 + neededCargos > (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToKeep)
+						neededCargos = (long) _tbotInstance.InstanceSettings.Brain.AutoCargo.MaxCargosToKeep - ownedCargoShips2;
 
 						var cost = _calculationService.CalcPrice(preferredCargoShip, (int) neededCargos);
 						if (tempCelestial.Resources.IsEnoughFor(cost))

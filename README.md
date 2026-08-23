@@ -7,13 +7,13 @@ OGame Bot
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/ogame-tbot/TBot)](https://github.com/ogame-tbot/TBot/releases/latest)
 [![Discord](https://img.shields.io/discord/801453618770214923)](https://discord.gg/NZSaY4aQ7J)
 
-TBot is a .NET 6 [OGame](https://lobby.ogame.gameforge.com/) bot based on [ogamed deamon](https://github.com/alaingilbert/ogame) by alaingilbert
+TBot is a .NET 10 [OGame](https://lobby.ogame.gameforge.com/) bot based on [ogamed deamon](https://github.com/alaingilbert/ogame) by alaingilbert
 
 Feel free to publish issues or pull requests
 
-TBot supports Ogame **v11.15**!
+TBot supports Ogame **v13.0.0**!
 
-## How to Update from 0.3.1
+## How to Update
 
 Be sure to remove .ogame folder from */home/username/* (linux) or *C:/Users/username* (win) before logging in
 
@@ -87,9 +87,10 @@ TBot has a wide variety of useful features. They all can be configured and custo
 Here follows a short explanation of each of them, read the [Wiki](https://github.com/ogame-tbot/TBot/wiki/Configuration-guide) for a more indepth explanation.
 
 * Defender: TBot checks periodically for incoming attacks
-  * Autofleet: TBot dispatches your endangered fleet and resources on the safest mission possible. A favourite type of mission can be set in the settings
+  * Autofleet: TBot dispatches your endangered fleet and resources on the safest mission possible. A favourite type of mission can be set in the settings. `DelayFleetSaveIfImpactOccurLaterThanNextCheck` skips an immediate fleetsave if the impact is farther away than the next scheduled check
   * MessageAttacker: TBot sends a message to the attacker(s). The message is picked randomly from the array given in the settings
-  * SpyAttacker: TBot automatically spies attacker with set number of probes
+  * SpyAttacker: TBot automatically spies attacker with set number of probes. This also fires when you're only spied (not just attacked with ships) - it spies back the origin plus its sibling celestial (planet/moon at the same coordinate), and expands to every coordinate previously seen for that player (`MaxKnownCoordinates` caps this), rate-limited per (player, coordinate) via `CooldownMinutes`
+  * SpyWatch: TBot sends a Telegram notice when someone spies you, even if `IgnoreProbes` would otherwise skip it silently. Cooldown per origin via `CooldownMinutes`
   * Alarm: TBot plays a nasty sound if under attack
   * TelegramMessenger: TBot sends you a notice if under attack (requires additional configuration, see [below](#telegram))
 * Expeditions: TBot will handle them for you
@@ -103,10 +104,21 @@ Here follows a short explanation of each of them, read the [Wiki](https://github
   * AutoResearchLF: TBot will research the LifeForms techs you selected up to the given level. Only researches with lv 1 or more will be researched. You must manually select the desired researches and upgrade them to lv 1 or more in order to TBot to account for them.
   * BuyOfferOfTheDay: TBot can buy the daily item from the Trader (check intervals are implemented so you can configure shorter check times when there is the specific event)
 * AutoFarm: TBot will scan one or more ranges of systems spying inactive players and attacking them with the specified type of ship if they are profitable above a given amount.
+  * FastFarmMode: TBot keeps a persistent cache of discovered targets (coordinates, last known buildings/resources, inactivity, defenses) so it can skip re-scanning/re-probing recently seen targets and extrapolate their current resources from elapsed time instead. Configure `FastFarmMode`, `FastFarmMaxCacheAge` (minutes) and `FastFarmIncludeMoons` in the instance settings. The extrapolation now also accounts for the target's own character class (Collector gets +25% mine production), read from their last report and kept in sync automatically.
+  * A cached/known target already inside `ScanRange` is no longer forcibly re-probed just because the range changed - if its cached report is still fresh (within `KeepReportFor`), it's reused instead, in both FastFarm and normal mode.
+  * Attacking defended targets: by default TBot only attacks fully defenceless targets. Set `AcceptableFleetLossPercentage` (0-100) to a value above 0 to allow attacking targets that still have some fleet/defence, as long as a battle simulation predicts the attacker's fleet-value loss stays within that percentage. The simulator now sizes the smallest combat fleet (in 10% steps of what's available) that still wins within that threshold, instead of always committing the whole available combat fleet, and also checks that the loot is worth the resource value expected to be lost (`MinLootToRiskRatio`). `Ships` lists which warship types TBot is allowed to draw on (from the same origin as the cargo ships) to fight through the defence - cargo ships themselves are always controlled separately by `CargoType`, not by this list.
+  * Anti-Bashing: TBot keeps a permanent, per-player record (`players_db_<alias>.json`, separate from the farm target cache) of everyone it has farmed. If a player it farmed before ever attacks back, they're permanently blacklisted from AutoFarm from then on, regardless of loot - always on, no setting needed.
+  * Poor-farm blacklist by player: with `Blacklist.Active`, a player whose confirmed real loot averages below `MinimumResourcesToNotBlacklist` across 3+ raids gets blacklisted everywhere they own a planet (`ATTACK_HISTORY`, keyed by player name), not just at the coordinate that triggered it.
+  * `ScoreWeights`: optional weighted target scoring (weight per resource type, discounted by flight distance) as an alternative to sorting purely by `PreferedResource`/total loot. Off by default.
+  * `SkipRecentlyActiveTargets`: skip a target this cycle if its espionage report shows activity in the last 60 minutes, even if the game still labels it inactive - avoids a possible trap or resources about to be moved. Off by default.
+  * `RecycleDebris`: for defended targets going through the battle simulation, if the predicted debris field (using the universe's real `DebrisFactor`/`DebrisFactorDef`) is above `MinDebrisToRecycle`, recyclers are sized and dispatched right after the attack, timed to land shortly after it. Off by default.
+  * ATTACK_HISTORY: every confirmed combat report is recorded (real loot per coordinate/player, in the same SQLite database as the farm target cache), independent of the espionage-estimate-only anti-bashing record above.
 * AutoHarvest: TBot will harvest expedition debris in your celestials' systems as well as your own DFs
 * AutoColonize: TBot will make new colonies. Input the list of coordinates of your desired colonies and TBot will do the rest.
+* Manual activity log: when `AutoFarm.Blacklist.ProcessAllReports` is `true`, TBot records any espionage/attack fleet it detects that it did **not** send itself (e.g. actions you took manually in the browser) to `data/manual_activity_<alias>.csv`. Off by default.
 * SleepMode: TBot will not interact with your account between the hours specified in settings
-  * AutoFleetSave: TBot will keep your fleets safe by dispatching them on the safest mission possible until wake up time (deploy with recall is supported!)
+  * AutoFleetSave: TBot will keep your fleets safe by dispatching them on the safest mission possible until wake up time (deploy with recall is supported!). `WarnPhalanxExposure` warns (log + Telegram) if the fleet ends up parked on a Planet instead of a Moon, exposed to Phalanx scan.
+* Resource priority order (`General.ResourcePriority`, default `["Deuterium", "Crystal", "Metal"]`): whenever a fleet's requested payload (fleetsave, repatriate, etc.) exceeds its actual cargo capacity, resources are loaded in this order instead of relying on the game's undocumented default - the resource(s) that don't fit are the ones left behind.
 * Local Proxy: Tbot allows you to play in your browser
   * Insert the hostname of the machine you'll run TBot onto in the settings (i.e.: localhost, or the local ip of a computer on your local network such as 192.168.X.X)
   * Navigate with your browser to http://*hostname:port*/game/index.php (remember to change hostname and port with the ones you specified in settings)
@@ -151,7 +163,7 @@ You can control and get info for TBot through a Telegram Bot. In order to enable
     * /ghostsleep - Wait fleets return, ghost harvest for current celestial only, and sleep for 5hours <code>/ghostsleep 4h3m or 3m50s Harvest</code>
     * /ghostsleepall - Wait fleets return, ghost harvest for all celestial and sleep for 5hours <code>/ghostsleepall 4h3m or 3m50s Harvest</code>
     * /ghost - Ghost for the specified amount of hours on the specified mission. Format: <code>/ghost 4h3m or 3m50s Harvest</code>
-    * /ghostmoons - Ghost moons fleet for the specified amount of hours on the specified mission. Format: <code>/ghostto 4h30m Harvest</code>
+    * /ghostmoons - Ghost moons fleet for the specified amount of hours on the specified mission. Format: <code>/ghostmoons 4h30m Harvest</code>
     * /switch - Switch current celestial resources and fleets to its planet or moon at the specified speed. Format: <code>/switch 5</code>
     * /deploy - Deploy to celestial with full ships and resources. Format: <code>/deploy 3:41:9 moon/planet 10</code>
     * /jumpgate - jumpgate to moon with full ships [full], or keeps needed cargo amount for resources [auto]. Format: <code>/jumpgate 2:41:9 auto/full</code>
@@ -159,12 +171,13 @@ You can control and get info for TBot through a Telegram Bot. In order to enable
     * /cancelghostsleep - Cancel planned /ghostsleep(expe) if not already sent
     * /spycrash - Create a debris field by crashing a probe on target or automatically selected planet. Format: <code>/spycrash 2:41:9/auto</code>
     * /recall - Enable/disable fleet auto recall. Format: <code>/recall true/false</code>
-    * /collect - Collect planets resources to JSON setting celestial
+    * /collect [Moon|Planet] - Collect planets resources to JSON setting celestial. Optional argument filters by celestial type
+    * /collectall [Moon|Planet] - Same as /collect but without the resource limit check
     * /build - Try to build buildable on each planet. Build max possible if no number value sent <code>/build LightFighter [100]</code>
-    * /collectdeut - Collect planets only deut resources -> to JSON repatriate setting celestial
+    * /collectdeut - Collect planets deut resources above minimum amount to JSON repatriate setting celestial. Format: <code>/collectdeut 500000</code>
     * /msg - Send a message to current attacker. Format: <code>/msg hello dude</code>
     * /sleep - Stop bot for the specified amount of hours. Format: <code>/sleep 4h3m or 3m50s</code>
-    * /wakeup - Wakeup bot\n" +
+    * /wakeup - Wakeup bot
     * /cancel - Cancel fleet with specified ID. Format: <code>/cancel 65656</code>
     * /getcelestials - Return the list of your celestials
     * /attacked - check if you're (still) under attack
@@ -186,6 +199,9 @@ You can control and get info for TBot through a Telegram Bot. In order to enable
     * /startlifeformautoresearch - start brain Lifeform autoresearch
     * /stopautofarm - stop autofarm
     * /startautofarm - start autofarm
+    * /clearcache - Clear FastFarm target cache file for current instance
+    * /stopautodiscovery - stop autodiscovery
+    * /startautodiscovery - start autodiscovery
  
 ### Settings Hot Reload
 TBot supports the editing of instance settings even while it is running. It will take care of turning on and off features as well as the specific feature config settings.
@@ -200,7 +216,7 @@ You can change settings from WebUI or editing the files directly.
   * Under "Language" type your universe community code. You can find it by logging to your account and analyzing the url, such as s161-us.ogame.gameforge.com => us
 * Configure the bot by editing all settings fields
   * All config options are sorted by feature, [check which features you](#features) want and configure them before activating
-* Make sure you have installed the [.NET 6 runtime](https://dotnet.microsoft.com/download/dotnet/6.0) for your platform
+* Make sure you have installed the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0) for your platform
 * Run TBot.exe
 
 ## Running on Linux/MacOS
@@ -219,7 +235,7 @@ You can change settings from WebUI or editing the files directly.
   * Under "Language" type your universe community code. You can find it by logging to your account and analyzing the url, such as s161-us.ogame.gameforge.com => **us**
 * Configure the bot by editing all instance settings.json fields
   * All config options are sorted by feature, [check which features](#features) you want and configure them before activating
-* Make sure you have installed the [.NET 6 runtime](https://dotnet.microsoft.com/download/dotnet/6.0) for your platform
+* Make sure you have installed the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0) for your platform
 * Run TBot
   * `./TBot`
 
@@ -239,11 +255,11 @@ $ ssh -i ~/pem/<my>.pem ec2-user@<instance's public ip-address>
 sudo yum update
 ```
 
-* Install the .NET 6 tuntime, which can be done using [these instructions for CentOs](https://docs.servicestack.net/deploy-netcore-to-amazon-linux-2-ami), and which is something like
+* Install the .NET 10 tuntime, which can be done using [these instructions for CentOs](https://docs.servicestack.net/deploy-netcore-to-amazon-linux-2-ami), and which is something like
 ```
 $ sudo rpm -Uvh https://packages.microsoft.com/config/centos/7/packages-microsoft-prod.rpm
-$ sudo yum install aspnetcore-runtime-6.0
-$ sudo yum install dotnet-sdk-6.0
+$ sudo yum install aspnetcore-runtime-10.0
+$ sudo yum install dotnet-sdk-10.0
 ```
 
 * Upload your TBot files, which were previously downloaded and setup correctly. You can do this by using something like FileZilla using sftp and the same credentials as the ssh connection and then copy your TBot folder into the user's home directory in the server. Make sure your settings file has the public ip of the aws instance and the port where you want to connect.
@@ -275,9 +291,91 @@ Feel free to fork and make pull requests or give suggestions posting an Issue or
 Also, a proper documentation about how to deal with settings would no doubt be helpful, especially for new users.
 
 ## Building
-We write and build TBot with Visual Studio 2022 Community Edition, thus .NET 6 SDK is enough for command line compilation.
+We write and build TBot with Visual Studio 2022 Community Edition. The project targets .NET 10, so the .NET 10 SDK is required for command line compilation.
 
 Releases are automated by GitHub Actions, take a look at the [workflows](https://github.com/ogame-tbot/TBot/tree/master/.github/workflows) if you are interested in the build process.
-  
+
+TBot needs its companion daemon, `ogamed`, built separately and placed next to
+`TBot.exe` in the output folder (see Step 3 below) — it is **not** bundled or
+copied by the `.csproj` anymore. This fork's `ogamed` must be built from its own
+repo's source, not downloaded from upstream's releases — see the [`ogame` repo's
+README](https://github.com/Outgrow1827/ogame#ogamed-service) for full instructions.
+Quick version, from the `ogame` repo root:
+```
+go build -ldflags "-s -w -X main.version=3.5.0" -o ogamed.exe ./cmd/ogamed
+```
+
+### Building locally (Windows x64)
+
+**Step 1 — install the .NET 10 SDK** (skip if `dotnet --version` already prints
+`10.x`). Either [download it manually](https://dotnet.microsoft.com/download/dotnet/10.0)
+or, on Windows, install via [winget](https://learn.microsoft.com/windows/package-manager/winget/)
+from a terminal:
+```
+winget install Microsoft.DotNet.SDK.10
+```
+
+**Step 2 — build.** Open a terminal in the solution root (the folder containing
+this `README.md` and `TBot.sln`) and run:
+```
+dotnet publish TBot\TBot.csproj -c Release
+```
+
+**Step 3 — install the runtime on the machine that will *run* TBot** (this can be
+a different machine than the one that built it). `TBot.exe` itself is
+self-contained — it doesn't need .NET installed to run — but the WebUI (built on
+ASP.NET Core/Kestrel) needs the ASP.NET Core 10 runtime present separately:
+```
+winget install Microsoft.DotNet.AspNetCore.10
+```
+
+The output lands in `C:\dev\TBot\bin\` (not inside the repo folder — kept out on
+purpose so the repo working copy stays clean of build artifacts) and contains:
+- `TBot.exe` — single-file, self-contained, compressed bundle (~65MB)
+- `TBot.Common.pdb`, `TBot.Ogame.Infrastructure.pdb`, `TBot.pdb`, `TBot.WebUI.pdb`
+- `appsettings.json`, `appsettings.Development.json`, `instance_settings.json`, `settings.json`
+- `profiles\` — example configuration profiles
+- `README.md`
+
+Copy your built `ogamed.exe` (from the Quick version step above) into this same
+`C:\dev\TBot\bin\` folder before running `TBot.exe` — it's a required sibling file
+at runtime, just no longer part of the build/publish output itself.
+
+No loose DLLs. Intermediate build files go to `%LOCALAPPDATA%\TBot-cache\` and no `obj\` folder is created inside the project directory. `refs\`, unused static web asset manifests, and the IIS in-process hosting module (`aspnetcorev2_inprocess.dll` - dead weight, TBot only ever runs via Kestrel) are removed automatically after both `build` and `publish`.
+
+**Why compressed self-contained, not the simpler single-file option**: a single-file bundle without compression gets memory-mapped directly from wherever `TBot.exe` lives as soon as the native host starts, before any of TBot's own code runs. That doesn't play well with non-local filesystems (e.g. a VMware shared folder) - the process can be killed by the OS with zero output before it even prints its first line. `EnableCompressionInSingleFile` forces the bundle to be extracted to a local disk cache (`%TEMP%`) on startup instead, which avoids that failure mode - but compression only works for self-contained publishes, hence the larger output than a plain framework-dependent single-file would be.
+
+### Building locally (Linux x64)
+
+**Step 1 — install the .NET 10 SDK.** On Ubuntu/Debian:
+```
+sudo apt-get update && sudo apt-get install -y dotnet-sdk-10.0
+```
+(If that package isn't available yet for your distro version, follow Microsoft's
+[official Linux install instructions](https://learn.microsoft.com/dotnet/core/install/linux)
+instead — the exact steps vary by distro.) Confirm with `dotnet --version` — it
+should print `10.x`.
+
+**Step 2 — build `ogamed` for Linux.** From the `ogame` repo root:
+```
+GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=3.5.0" -o ogamed ./cmd/ogamed
+```
+
+**Step 3 — build TBot**, overriding the runtime identifier (the `.csproj` defaults
+to `win-x64`):
+```
+dotnet publish TBot/TBot.csproj -c Release -p:RuntimeIdentifier=linux-x64
+```
+
+The output lands in the configured publish directory with the same file list as
+the Windows build above, except the main binary is named `TBot` (no extension) and
+the native SQLite library is `libe_sqlite3.so` instead of `e_sqlite3.dll`. Copy the
+`ogamed` binary built in Step 2 into that same output folder before running. **The
+build doesn't always mark `TBot` as executable** — if you get "Permission denied"
+trying to run it, fix that with:
+```
+chmod +x TBot
+```
+
 ## Portability
 TBot is currently developed and mantained for Windows 64bit, Windows 32bit, Linux x86_64, MacOS 64bit, MacOS ARM, Linux ARMv7 and Linux ARM64.

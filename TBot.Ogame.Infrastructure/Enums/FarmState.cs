@@ -16,6 +16,9 @@ namespace TBot.Ogame.Infrastructure.Enums {
 		ProbesRequired,
 		/// Additional espionage probes were sent, but insufficient, more required.
 		FailedProbesRequired,
+		/// Defenses couldn't be determined from an espionage report - a single Espionage Probe was
+		/// sent as an Attack mission instead, to detect defenses by whether it survives.
+		DefenseProbing,
 		/// Suitable target detected, attack is pending.
 		AttackPending,
 		/// Suitable target detected, attack is ongoing.

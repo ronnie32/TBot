@@ -4,12 +4,17 @@ using TBot.Ogame.Infrastructure.Models;
 namespace TBot.Ogame.Infrastructure {
 	public interface IOgameService {
 		event EventHandler OnError;
+		string PlayerNameForLogs { get; set; }
 		void Initialize(Credentials credentials,
 				Device device,
 				ProxySettings proxySettings,
 				string host = "127.0.0.1",
 				int port = 8080,
-				string captchaKey = "");
+				string captchaKey = "",
+				bool hideAccountNameInLogs = false,
+				string telegramSolverBotToken = "",
+				long telegramSolverChatId = 0,
+				int manualModeTimeout = 30);
 		string GetExecutableName();
 		bool ValidatePrerequisites();
 		Task BuildCancelable(Celestial celestial, Buildables buildable);
@@ -46,6 +51,8 @@ namespace TBot.Ogame.Infrastructure {
 		Task<LFTechs> GetLFTechs(Celestial celestial);
 		Task<ArtifactInventory> GetArtifactInventory(Celestial celestial);
 		Task<LFBonuses> GetLFBonuses();
+		Task<LFBonuses> GetLFBonuses(Celestial celestial);
+		Task<ArtifactsInfo> GetArtifacts(Celestial celestial);
 		Task<Moon> GetMoon(Moon moon);
 		Task<List<Moon>> GetMoons();
 		Task<string> GetOgamedIP();
@@ -67,6 +74,8 @@ namespace TBot.Ogame.Infrastructure {
 		Task<int> GetServerSpeed();
 		Task<DateTime> GetServerTime();
 		Task<string> GetServerUrl();
+		Task<string> GetHighscoreXml(int category, int type);
+		Task<string> GetPlayersXml();
 		Task<string> GetServerVersion();
 		Task<Ships> GetShips(Celestial celestial);
 		Task<Slots> GetSlots();

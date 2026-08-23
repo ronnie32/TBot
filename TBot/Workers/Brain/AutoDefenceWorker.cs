@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using Tbot.Common.Settings;
 using Tbot.Helpers;
 using Tbot.Includes;
 using Tbot.Services;
@@ -39,7 +40,7 @@ namespace Tbot.Workers.Brain {
 				List<Celestial> newCelestials = _tbotInstance.UserData.celestials.ToList();
 				List<Celestial> celestialsToExclude = _calculationService.ParseCelestialsList(_tbotInstance.InstanceSettings.Brain.AutoDefence.Exclude, _tbotInstance.UserData.celestials);
 
-				Defences neededDefences = new(
+				Defences manualDefences = new(
 					(long) _tbotInstance.InstanceSettings.Brain.AutoDefence.DefenceToReach.RocketLauncher,
 					(long) _tbotInstance.InstanceSettings.Brain.AutoDefence.DefenceToReach.LightLaser,
 					(long) _tbotInstance.InstanceSettings.Brain.AutoDefence.DefenceToReach.HeavyLaser,
@@ -51,6 +52,12 @@ namespace Tbot.Workers.Brain {
 					(long) _tbotInstance.InstanceSettings.Brain.AutoDefence.DefenceToReach.AntiBallisticMissiles,
 					(long) _tbotInstance.InstanceSettings.Brain.AutoDefence.DefenceToReach.InterplanetaryMissiles
 				);
+				bool useProductionBasedCalculation = SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.Brain.AutoDefence, "UseProductionBasedCalculation") &&
+					(bool) _tbotInstance.InstanceSettings.Brain.AutoDefence.UseProductionBasedCalculation;
+				int productionCoverageHours = SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.Brain.AutoDefence, "ProductionCoverageHours") ?
+					(int) _tbotInstance.InstanceSettings.Brain.AutoDefence.ProductionCoverageHours : 24;
+				int maxConstructionMinutes = SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.Brain.AutoDefence, "MaxConstructionMinutes") ?
+					(int) _tbotInstance.InstanceSettings.Brain.AutoDefence.MaxConstructionMinutes : 60;
 				foreach (Celestial celestial in (bool) _tbotInstance.InstanceSettings.Brain.AutoDefence.RandomOrder ? _tbotInstance.UserData.celestials.Shuffle().ToList() : _tbotInstance.UserData.celestials) {
 					if (celestialsToExclude.Has(celestial)) {
 						DoLog(LogLevel.Information, $"Skipping {celestial.ToString()}: celestial in exclude list.");
@@ -79,12 +86,37 @@ namespace Tbot.Workers.Brain {
 					tempCelestial = await _tbotOgameBridge.UpdatePlanet(tempCelestial, UpdateTypes.Defences);
 					tempCelestial = await _tbotOgameBridge.UpdatePlanet(tempCelestial, UpdateTypes.Resources);
 					tempCelestial = await _tbotOgameBridge.UpdatePlanet(tempCelestial, UpdateTypes.LFBonuses);
+					tempCelestial = await _tbotOgameBridge.UpdatePlanet(tempCelestial, UpdateTypes.Facilities);
 
 					var capacity = _calculationService.CalcFleetCapacity(tempCelestial.Ships, _tbotInstance.UserData.serverData, _tbotInstance.UserData.researches.HyperspaceTechnology, tempCelestial.LFBonuses, _tbotInstance.UserData.userInfo.Class, _tbotInstance.UserData.serverData.ProbeCargo);
 					if (tempCelestial.Coordinate.Type == Celestials.Moon && (bool) _tbotInstance.InstanceSettings.Brain.AutoDefence.ExcludeMoons) {
 						DoLog(LogLevel.Information, $"Skipping {tempCelestial.ToString()}: celestial is a moon.");
 						continue;
 					}
+
+					Defences neededDefences;
+					if (useProductionBasedCalculation && tempCelestial is Planet planetForCalc) {
+						neededDefences = _calculationService.CalcNeededDefenceFromProduction(planetForCalc, _tbotInstance.UserData.researches, _tbotInstance.UserData.serverData, productionCoverageHours, _tbotInstance.UserData.userInfo.Class, _tbotInstance.UserData.staff.Geologist, _tbotInstance.UserData.staff.IsFull);
+						// DefenceToReach doubles as a mask even with the formula active: a type only
+						// gets built if the user has it configured (>0) there. Anything left at 0 in
+						// DefenceToReach is opted out entirely, regardless of what the formula computes.
+						if (manualDefences.RocketLauncher <= 0) neededDefences.RocketLauncher = 0;
+						if (manualDefences.LightLaser <= 0) neededDefences.LightLaser = 0;
+						if (manualDefences.HeavyLaser <= 0) neededDefences.HeavyLaser = 0;
+						if (manualDefences.GaussCannon <= 0) neededDefences.GaussCannon = 0;
+						if (manualDefences.PlasmaTurret <= 0) neededDefences.PlasmaTurret = 0;
+						// The Bontchev formula only covers RocketLauncher/LightLaser/HeavyLaser/GaussCannon/PlasmaTurret -
+						// IonCannon, AntiBallisticMissiles and the shield domes always come from the manual
+						// DefenceToReach setting, toggle or not.
+						neededDefences.IonCannon = manualDefences.IonCannon;
+						neededDefences.SmallShieldDome = manualDefences.SmallShieldDome;
+						neededDefences.LargeShieldDome = manualDefences.LargeShieldDome;
+						neededDefences.AntiBallisticMissiles = manualDefences.AntiBallisticMissiles;
+						neededDefences.InterplanetaryMissiles = manualDefences.InterplanetaryMissiles;
+					} else {
+						neededDefences = manualDefences;
+					}
+
 					Defences currentDefences = tempCelestial.Defences;
 					Defences defencesToBuild = neededDefences.Difference(currentDefences);
 					if (defencesToBuild.IsEmpty()) {
@@ -101,11 +133,26 @@ namespace Tbot.Workers.Brain {
 							continue;
 						}
 						DoLog(LogLevel.Information, $"{tempCelestial.ToString()}: Defences to build: {defencesToBuild.ToString()}");
-						try {
-							foreach (var (defenceType, amountNeeded) in defencesToBuild.GetDefenceTypesWithAmount()) {
-								await _ogameService.BuildDefences(tempCelestial, defenceType, amountNeeded);
+
+						// OGame only accepts one defence production order at a time - pick the
+						// cheapest deficit type (cost per unit) and build only that this cycle.
+						var cheapestFirst = defencesToBuild.GetDefenceTypesWithAmount()
+							.OrderBy(kv => _calculationService.CalcPrice(kv.Key, 1, tempCelestial.LFBonuses).TotalResources)
+							.ToList();
+						var (defenceType, amountNeeded) = cheapestFirst.First();
+
+						if (maxConstructionMinutes > 0) {
+							long predictedMinutes = _calculationService.CalcProductionTime(defenceType, (int) amountNeeded, _tbotInstance.UserData.serverData, tempCelestial.Facilities) / 60;
+							if (predictedMinutes > maxConstructionMinutes && predictedMinutes > 0) {
+								long cappedAmount = Math.Max(1, amountNeeded * maxConstructionMinutes / predictedMinutes);
+								DoLog(LogLevel.Information, $"{tempCelestial.ToString()}: capping {defenceType} order from {amountNeeded} to {cappedAmount} (would take {predictedMinutes}min, cap is {maxConstructionMinutes}min).");
+								amountNeeded = cappedAmount;
 							}
-							DoLog(LogLevel.Information, "Production succesfully started.");
+						}
+
+						try {
+							await _ogameService.BuildDefences(tempCelestial, defenceType, amountNeeded);
+							DoLog(LogLevel.Information, $"Production of {amountNeeded}x{defenceType} succesfully started.");
 						} catch {
 							DoLog(LogLevel.Warning, "Unable to start defence production.");
 						}

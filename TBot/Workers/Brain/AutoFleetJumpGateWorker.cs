@@ -200,12 +200,19 @@ namespace Tbot.Workers.Brain {
 						return;
 					}
 
-					// Build actions: best -> target, then pairwise i=1 -> i+1
+					// Build actions: best -> target, then pairwise i=1 -> i+1, consolidating the rest
+					// towards the target over subsequent cycles. When the source-moon count is even,
+					// one moon would otherwise be left out of every pair - send it straight to the
+					// target too instead of stranding it (2026-08-03 fix).
 					var teleportsPairs = new List<(Moon origin, Celestial destination)>();
 					teleportsPairs.Add((orderedMoons[0], moondest));
 
 					for (var i = 1; i + 1 < orderedMoons.Count; i += 2) {
 						teleportsPairs.Add((orderedMoons[i], orderedMoons[i + 1]));
+					}
+
+					if (orderedMoons.Count % 2 == 0 && orderedMoons.Count > 1) {
+						teleportsPairs.Add((orderedMoons[orderedMoons.Count - 1], moondest));
 					}
 
 					for (var i = 0; i < teleportsPairs.Count; i++) {

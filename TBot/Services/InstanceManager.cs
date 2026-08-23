@@ -55,7 +55,7 @@ namespace Tbot.Services {
 		public async void OnSettingsChanged() {
 			await instancesSem.WaitAsync();
 
-			_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Reading settings \"{SettingsAbsoluteFilepath}\"");
+			_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Reading settings \"{Path.GetFileName(SettingsAbsoluteFilepath)}\"");
 
 			// Read settings first
 			_mainSettings = await SettingsService.GetSettings(SettingsAbsoluteFilepath);
@@ -121,13 +121,13 @@ namespace Tbot.Services {
 
 					// Check if already initialized. if that so, update alias and keep going
 					if (instances.Any(c => c._botSettingsPath == cInstanceSettingPath) == true) {
-						_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Instance \"{alias}\" \"{cInstanceSettingPath}\" already inited.");
+						_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Instance \"{alias}\" \"{Path.GetFileName(cInstanceSettingPath)}\" already inited.");
 						var foundInstance = instances.First(c => c._botSettingsPath == cInstanceSettingPath);
 						foundInstance._alias = alias;
 
 						newInstances.Add(foundInstance);
 					} else {
-						_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Enqueueing initialization of instance \"{alias}\" \"{cInstanceSettingPath}\"");
+						_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Enqueueing initialization of instance \"{alias}\" \"{Path.GetFileName(cInstanceSettingPath)}\"");
 						instancesToBeInited.Add(instance);
 					}
 				}
@@ -136,7 +136,7 @@ namespace Tbot.Services {
 			// Deinitialize instances that are no more valid (not present in newInstances)
 			foreach (var deInstance in instances) {
 				if (newInstances.Any(c => string.Compare(c._botSettingsPath, deInstance._botSettingsPath) == 0) == false) {
-					_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Deinitializing instance \"{deInstance._alias}\" \"{deInstance._botSettingsPath}\"");
+					_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Deinitializing instance \"{deInstance._alias}\" \"{Path.GetFileName(deInstance._botSettingsPath)}\"");
 
 					deinitingInstances.Add(deInstance._botMain.DisposeAsync().AsTask());
 				}
@@ -147,7 +147,7 @@ namespace Tbot.Services {
 			foreach (var instanceToBeInited in instancesToBeInited) {
 				string cInstanceSettingPath = instanceToBeInited.SettingsPath;
 				string alias = instanceToBeInited.Alias;
-				_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Asynchronously initializing instance \"{alias}\" \"{cInstanceSettingPath}\"");
+				_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Asynchronously initializing instance \"{alias}\" \"{Path.GetFileName(cInstanceSettingPath)}\"");
 				awaitingInstances.Add(StartTBotMain(cInstanceSettingPath, alias));
 				//Generate random sleeptime
 				Random waitTime = new Random();
@@ -194,7 +194,7 @@ namespace Tbot.Services {
 		public async ValueTask DisposeAsync() {
 			List<Task> deinitTasks = new();
 			foreach (var instance in instances) {
-				_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Deinitializing instance \"{instance._alias}\" \"{instance._botSettingsPath}\"");
+				_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Deinitializing instance \"{instance._alias}\" \"{Path.GetFileName(instance._botSettingsPath)}\"");
 				deinitTasks.Add(instance.Deinitialize());
 			}
 			await Task.WhenAll(deinitTasks);
@@ -246,18 +246,26 @@ namespace Tbot.Services {
 
 
 		private async Task<TbotInstanceData> StartTBotMain(string settingsPath, string alias) {
-			_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Initializing instance \"{alias}\" \"{settingsPath}\"");
+			_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Initializing instance \"{alias}\" \"{Path.GetFileName(settingsPath)}\"");
 
 			try {
 				if (File.Exists(settingsPath) == false) {
-					_logger.WriteLog(LogLevel.Warning, LogSender.Main, $"Instance \"{alias}\" cannot be initialized. \"{settingsPath}\" does not exist");
+					_logger.WriteLog(LogLevel.Warning, LogSender.Main, $"Instance \"{alias}\" cannot be initialized. \"{Path.GetFileName(settingsPath)}\" does not exist");
 					throw new MissingConfigurationException($"Instance \"{alias}\" cannot be initialized. \"{settingsPath}\" does not exist");
 				} else {
 
 					var scope = _scopeFactory.CreateScope();
 					var tBotInstance = scope.ServiceProvider.GetRequiredService<ITBotMain>();
 
-					await tBotInstance.Init(settingsPath, alias, telegramMessenger);	// This may throw
+					string telegramSolverBotToken = "";
+					long telegramSolverChatId = 0;
+					if (SettingsService.IsSettingSet(_mainSettings, "TelegramMessenger") &&
+						SettingsService.IsSettingSet(_mainSettings.TelegramMessenger, "API") &&
+						SettingsService.IsSettingSet(_mainSettings.TelegramMessenger, "ChatId")) {
+						telegramSolverBotToken = (string) _mainSettings.TelegramMessenger.API;
+						long.TryParse((string) _mainSettings.TelegramMessenger.ChatId, out telegramSolverChatId);
+					}
+					await tBotInstance.Init(settingsPath, alias, telegramMessenger, telegramSolverBotToken, telegramSolverChatId);	// This may throw
 
 					_logger.WriteLog(LogLevel.Information, LogSender.Main, $"Instance \"{alias}\" initialized successfully!");
 					// Add a OnError callback so we can remove it from our list if an error occurred
