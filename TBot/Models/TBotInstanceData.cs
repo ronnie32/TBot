@@ -12,6 +12,9 @@ namespace Tbot.Models {
 		public IServiceScope ServiceScope;
 		public string _botSettingsPath;
 		public string _alias;
+		public bool IsInitialized { get; set; } = true;
+		private bool _deinitialized;
+		private Exception _cleanupFailure;
 
 		public TbotInstanceData(ITBotMain botMain, IServiceScope serviceScope, string botSettingsPath, string alias) {
 			_botMain = botMain;
@@ -29,11 +32,31 @@ namespace Tbot.Models {
 		}
 
 		public async Task Deinitialize() {
+			if (_deinitialized)
+				return;
+			if (_cleanupFailure != null)
+				throw new InvalidOperationException($"Cleanup previously failed for instance \"{_alias}\"; a replacement cannot be started safely.", _cleanupFailure);
+
+			IsInitialized = false;
+			try {
+				// The DI scope owns its async services, including TBotMain.
+				if (ServiceScope is IAsyncDisposable asyncScope) {
+					await asyncScope.DisposeAsync();
+				} else {
+					try {
+						if (_botMain != null)
 			await _botMain.DisposeAsync();
-			if (ServiceScope is IAsyncDisposable asyncScope)
-				await asyncScope.DisposeAsync();
-			else
-				ServiceScope.Dispose();
+					} finally {
+						ServiceScope?.Dispose();
+					}
+				}
+				_deinitialized = true;
+			} catch (Exception exception) {
+				// A failed DI disposal cannot reliably be retried: the scope may
+				// already consider itself disposed while a service is still alive.
+				_cleanupFailure = exception;
+				throw;
 		}
 	}
+}
 }

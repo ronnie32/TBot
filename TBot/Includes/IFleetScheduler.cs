@@ -15,11 +15,13 @@ namespace Tbot.Includes {
 		void SetTBotOgameBridge(ITBotOgamedBridge tbotOgameBridge);
 		Task SpyCrash(Celestial fromCelestial, Coordinate target = null);
 		Task AutoFleetSave(Celestial celestial, bool isSleepTimeFleetSave = false, long minDuration = 0, bool WaitFleetsReturn = false, Missions TelegramMission = Missions.None, bool fromTelegram = false, bool saveall = false);
+		Task<int?> AutoFleetSaveWithResult(Celestial celestial, long minDuration = 0);
 		Task<int> SendFleet(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload = null, CharacterClass playerClass = CharacterClass.NoClass, bool force = false);
 		Task<int> SendValidatedFleet(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload = null, CharacterClass playerClass = CharacterClass.NoClass, bool force = false);
 		Task<int> SendExpedition(Celestial origin, Ships ships, Coordinate destination, decimal speed, Resources payload = null, CharacterClass playerClass = CharacterClass.NoClass);
 		Task<DiscoveryDispatchResult> SendDiscovery(Celestial origin, Coordinate destination);
 		Task<DiscoverySystemDispatchResult> SendSystemDiscovery(Celestial origin, int galaxy, int system, int expectedFleetCount);
+		Task<DiscoverySystemDispatchResult> SendSystemDiscovery(Celestial origin, int galaxy, int system, int expectedFleetCount, IReadOnlyList<int> positions);
 		bool LastFleetSnapshotWasFresh { get; }
 		Task CancelFleet(Fleet fleet);
 		Task<List<Fleet>> UpdateFleets();

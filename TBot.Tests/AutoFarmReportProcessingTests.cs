@@ -397,7 +397,7 @@ namespace TBot.Tests {
 				_ => Proxy<ITBotMain>.Default(method.ReturnType)
 			});
 			var ogame = Proxy<IOgameService>.Create((method, args) => method.Name switch {
-				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(new List<EspionageReportSummary> { summary }),
+				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult((int)args[0] == 1 ? new List<EspionageReportSummary> { summary } : new List<EspionageReportSummary>()),
 				nameof(IOgameService.GetEspionageReport) => Task.FromResult(report),
 				nameof(IOgameService.GetGalaxyInfo) => Task.FromResult(new GalaxyInfo { Planets = new List<Planet>() }),
 				nameof(IOgameService.DeleteReport) => DeleteReport(deletedReports, (int)args[0]),
@@ -462,7 +462,7 @@ namespace TBot.Tests {
 
 				var parent = CreateParent(alias, settings, userData);
 				var ogame = Proxy<IOgameService>.Create((method, args) => method.Name switch {
-				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(new List<EspionageReportSummary> { summary }),
+				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult((int)args[0] == 1 ? new List<EspionageReportSummary> { summary } : new List<EspionageReportSummary>()),
 					nameof(IOgameService.GetEspionageReport) => Task.FromResult(report),
 					nameof(IOgameService.GetGalaxyInfo) => Task.FromResult(new GalaxyInfo {
 						Planets = new List<Planet> {
@@ -525,7 +525,7 @@ namespace TBot.Tests {
 				new List<string> { "{}" });
 			var parent = CreateParent(alias, settings, userData);
 			var ogame = Proxy<IOgameService>.Create((method, args) => method.Name switch {
-				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(new List<EspionageReportSummary> { summary }),
+				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult((int)args[0] == 1 ? new List<EspionageReportSummary> { summary } : new List<EspionageReportSummary>()),
 				nameof(IOgameService.GetEspionageReport) => Task.FromResult(report),
 				nameof(IOgameService.GetGalaxyInfo) => throw new InvalidOperationException("temporary galaxy lookup failure"),
 				nameof(IOgameService.DeleteReport) => DeleteReport(deletedReports, (int) args[0]),
@@ -595,7 +595,7 @@ namespace TBot.Tests {
 
 			var parent = CreateParent(alias, settings, userData);
 			var ogame = Proxy<IOgameService>.Create((method, args) => method.Name switch {
-				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(new List<EspionageReportSummary> { summary }),
+				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult((int)args[0] == 1 ? new List<EspionageReportSummary> { summary } : new List<EspionageReportSummary>()),
 				nameof(IOgameService.GetEspionageReport) => Task.FromResult(externalReport),
 				nameof(IOgameService.DeleteReport) => DeleteReport(deletedReports, (int) args[0]),
 				_ => Proxy<IOgameService>.Default(method.ReturnType)
@@ -652,7 +652,7 @@ namespace TBot.Tests {
 
 			var parent = CreateParent(alias, settings, userData);
 			var ogame = Proxy<IOgameService>.Create((method, args) => method.Name switch {
-				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(new List<EspionageReportSummary> { summary }),
+				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult((int)args[0] == 1 ? new List<EspionageReportSummary> { summary } : new List<EspionageReportSummary>()),
 				nameof(IOgameService.GetEspionageReport) => Task.FromResult(report),
 				nameof(IOgameService.GetGalaxyInfo) => Task.FromResult(new GalaxyInfo {
 					Planets = new List<Planet> { new Planet { Coordinate = coordinate, Inactive = true } }
@@ -725,7 +725,7 @@ namespace TBot.Tests {
 				new EspionageReportSummary { ID = ownedReport.ID, Type = EspionageReportType.Report, Target = ownedCoordinate }
 			};
 			var ogame = Proxy<IOgameService>.Create((method, args) => method.Name switch {
-				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(summaries),
+				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult((int)args[0] == 1 ? summaries : new List<EspionageReportSummary>()),
 				nameof(IOgameService.GetEspionageReport) => Task.FromResult(reports[(int)args[0]]),
 				nameof(IOgameService.DeleteReport) => DeleteReport(deletedReports, (int)args[0]),
 				_ => Proxy<IOgameService>.Default(method.ReturnType)
@@ -802,7 +802,7 @@ namespace TBot.Tests {
 				new EspionageReportSummary { ID = ownedReport.ID, Type = EspionageReportType.Report, Target = ownedCoordinate }
 			};
 			var ogame = Proxy<IOgameService>.Create((method, args) => method.Name switch {
-				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(summaries),
+				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult((int)args[0] == 1 ? summaries : new List<EspionageReportSummary>()),
 				nameof(IOgameService.GetEspionageReport) => ReadReport(reports, reportReadOrder, (int)args[0]),
 				nameof(IOgameService.DeleteReport) => DeleteReport(deletedReports, (int)args[0]),
 				_ => Proxy<IOgameService>.Default(method.ReturnType)

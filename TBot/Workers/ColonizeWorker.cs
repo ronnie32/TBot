@@ -20,6 +20,13 @@ namespace Tbot.Workers {
 		private readonly IFleetScheduler _fleetScheduler;
 		private readonly ICalculationService _calculationService;
 		private readonly ITBotOgamedBridge _tbotOgameBridge;
+		// Guards concurrent abandon checks between the fast watcher and the regular Execute() cycle,
+		// so we never run two abandon-passes (and thus two AbandonCelestial calls / celestials list
+		// mutations) at the same time.
+		private readonly SemaphoreSlim _abandonLock = new(1, 1);
+		private Task _abandonWatcherTask;
+		private CancellationTokenSource _abandonWatcherCts;
+
 		public ColonizeWorker(ITBotMain parentInstance,
 			IOgameService ogameService,
 			IFleetScheduler fleetScheduler,
@@ -52,38 +59,10 @@ namespace Tbot.Workers {
 		protected override async Task Execute() {
 			await _tbotOgameBridge.CheckCelestials();
 			bool stop = false;
-			Fields fieldsSettings = new() {
-				Total = (int) _tbotInstance.InstanceSettings.AutoColonize.Abandon.MinFields
-			};
-			Temperature temperaturesSettings = new() {
-				Min = (int) _tbotInstance.InstanceSettings.AutoColonize.Abandon.MinTemperatureAcceptable,
-				Max = (int) _tbotInstance.InstanceSettings.AutoColonize.Abandon.MaxTemperatureAcceptable
-			};
 			try {
-				if ((bool) _tbotInstance.InstanceSettings.AutoColonize.Abandon.Active) {
-					DoLog(LogLevel.Information, "Detecting planet to abandon");
-
-					List<Celestial> newCelestials = _tbotInstance.UserData.celestials.ToList();
-					var dic = new Dictionary<Coordinate, Celestial>();
-				
-					foreach (Planet planet in _tbotInstance.UserData.celestials.Where(c => c is Planet)) {
-						Planet tempCelestial = await _tbotOgameBridge.UpdatePlanet(planet, UpdateTypes.Fast) as Planet;						
-						if (tempCelestial.Coordinate.Type == Celestials.Planet && tempCelestial.Fields.Built == 0) {
-							if (_calculationService.ShouldAbandon(tempCelestial as Planet, tempCelestial.Fields.Total, tempCelestial.Temperature.Max, fieldsSettings, temperaturesSettings)) {
-								DoLog(LogLevel.Debug, $"This planet should be abandoned: {tempCelestial.ToString()}");
-								if (await _ogameService.AbandonCelestial(tempCelestial)) {
-									DoLog(LogLevel.Debug, $"Successful Abandon on {tempCelestial.ToString()}.");
-								} else {
-									DoLog(LogLevel.Debug, $"Failed Abandon on {tempCelestial.ToString()}.");
-								}
-							} else {
-								DoLog(LogLevel.Debug, $"No planet should be abandoned.");
-							}
-							//DoLog(LogLevel.Debug, $"Because: cases -> {tempCelestial.Fields.Total.ToString()}/{fieldsSettings.Total.ToString()}, MinimumTemp -> {tempCelestial.Temperature.Max.ToString()}>={temperaturesSettings.Min.ToString()}, MaximumTemp -> {tempCelestial.Temperature.Max.ToString()}<={temperaturesSettings.Max.ToString()}");
-						}
-					}
-					await _tbotOgameBridge.CheckCelestials();
-					DoLog(LogLevel.Information, "End of planet abandonment");
+				if ((bool)_tbotInstance.InstanceSettings.AutoColonize.Abandon.Active) {
+					EnsureAbandonWatcherRunning();
+					await CheckAndAbandonUnfitPlanets(_ct);
 				}
 
 				if ((bool) _tbotInstance.InstanceSettings.AutoColonize.Active) {
@@ -370,6 +349,138 @@ namespace Tbot.Workers {
 					
 					await _tbotOgameBridge.CheckCelestials();
 				}
+			}
+		}
+		public override async Task StopWorker() {
+			await base.StopWorker();
+			StopAbandonWatcher();
+			if (_abandonWatcherTask != null) {
+				try { await _abandonWatcherTask; } catch (OperationCanceledException) { }
+				_abandonWatcherTask = null;
+			}
+			_abandonWatcherCts?.Dispose();
+			_abandonWatcherCts = null;
+		}
+
+		private void EnsureAbandonWatcherRunning() {
+			if (_abandonWatcherTask != null && !_abandonWatcherTask.IsCompleted) {
+				return;
+			}
+			_abandonWatcherCts?.Dispose();
+			_abandonWatcherCts = CancellationTokenSource.CreateLinkedTokenSource(_ct);
+			var token = _abandonWatcherCts.Token;
+			_abandonWatcherTask = Task.Run(() => AbandonWatcherLoop(token), token);
+		}
+
+		private void StopAbandonWatcher() {
+			try {
+				_abandonWatcherCts?.Cancel();
+			} catch (ObjectDisposedException) {
+				// already disposed, nothing to do
+	}
+}
+
+		private async Task AbandonWatcherLoop(CancellationToken ct) {
+			DoLog(LogLevel.Information, "Fast abandon watcher started.");
+			while (!ct.IsCancellationRequested) {
+				try {
+					if (!IsWorkerEnabledBySettings() || !(bool) _tbotInstance.InstanceSettings.AutoColonize.Abandon.Active) {
+						break;
+					}
+
+					// Read the already-updated shared fleet list instead of calling UpdateFleets()
+					// ourselves - avoids an extra webserver round trip from this background loop.
+					var fleets = _tbotInstance.UserData.fleets;
+					var nextArrival = (fleets ?? Enumerable.Empty<Fleet>())
+						.Where(f => f.Mission == Missions.Colonize && !f.ReturnFlight)
+						.OrderBy(f => f.ArriveIn)
+						.FirstOrDefault();
+
+					if (nextArrival == null) {
+						// Nothing colonizing right now - nothing to check. Back off and just
+						// glance again later in case a new colony ship gets sent out meanwhile.
+						await Task.Delay(TimeSpan.FromSeconds(20), ct);
+						continue;
+					}
+
+					// Sleep until (just after) the fleet is expected to land - this is the only
+					// moment a check actually makes sense, so this is the only moment we hit the
+					// webserver for it.
+					var waitMs = (int) (nextArrival.ArriveIn * 1000) + (int) RandomizeHelper.CalcRandomInterval(IntervalType.AFewSeconds);
+					DoLog(LogLevel.Debug, $"Colonize fleet to {nextArrival.Destination} arrives in {nextArrival.ArriveIn}s, scheduling abandon-check for {TimeSpan.FromMilliseconds(waitMs)} from now.");
+					if (waitMs > 0) {
+						await Task.Delay(waitMs, ct);
+					}
+
+					DoLog(LogLevel.Information, "Colonize fleet should have landed, checking newly colonized planet(s) for abandon criteria.");
+					await CheckAndAbandonUnfitPlanets(ct);
+				} catch (OperationCanceledException) {
+					break;
+				} catch (Exception e) {
+					DoLog(LogLevel.Warning, $"Abandon watcher exception: {e.Message}");
+					try {
+						await Task.Delay(TimeSpan.FromSeconds(10), ct);
+					} catch (OperationCanceledException) {
+						break;
+					}
+				}
+			}
+			DoLog(LogLevel.Information, "Fast abandon watcher stopped.");
+		}
+
+		/// <summary>
+		/// Scans all planets for freshly colonized (Fields.Built == 0) celestials that fail the
+		/// abandon criteria and abandons them. Guarded by _abandonLock so the watcher and the regular
+		/// Execute() cycle never run this concurrently against each other.
+		/// </summary>
+		private async Task CheckAndAbandonUnfitPlanets(CancellationToken ct) {
+			if (!await _abandonLock.WaitAsync(0, ct)) {
+				// Another abandon pass is already in progress (watcher or Execute()) - skip this
+				// round rather than block, the next tick will pick it up.
+				DoLog(LogLevel.Debug, "Skipping abandon-check, another one is already in progress.");
+				return;
+			}
+			DoLog(LogLevel.Information, "Checking celestials for planets to abandon.");
+			int abandonedCount = 0;
+			try {
+				Fields fieldsSettings = new() {
+					Total = (int) _tbotInstance.InstanceSettings.AutoColonize.Abandon.MinFields
+				};
+				Temperature temperaturesSettings = new() {
+					Min = (int) _tbotInstance.InstanceSettings.AutoColonize.Abandon.MinTemperatureAcceptable,
+					Max = (int) _tbotInstance.InstanceSettings.AutoColonize.Abandon.MaxTemperatureAcceptable
+				};
+
+				foreach (Planet planet in _tbotInstance.UserData.celestials.Where(c => c is Planet).ToList()) {
+					ct.ThrowIfCancellationRequested();
+					if (!IsWorkerEnabledBySettings() || !(bool) _tbotInstance.InstanceSettings.AutoColonize.Abandon.Active) {
+						DoLog(LogLevel.Information, "AutoColonize/Abandon got disabled mid-check, aborting abandon-check.");
+						break;
+					}
+					Planet tempCelestial = await _tbotOgameBridge.UpdatePlanet(planet, UpdateTypes.Fast) as Planet;
+					ct.ThrowIfCancellationRequested();
+					if (!IsWorkerEnabledBySettings() || !(bool)_tbotInstance.InstanceSettings.AutoColonize.Abandon.Active) break;
+					if (tempCelestial == null) {
+						continue;
+					}
+					if (tempCelestial.Coordinate.Type == Celestials.Planet && tempCelestial.Fields.Built == 0) {
+						if (_calculationService.ShouldAbandon(tempCelestial, tempCelestial.Fields.Total, tempCelestial.Temperature.Max, fieldsSettings, temperaturesSettings)) {
+							DoLog(LogLevel.Debug, $"This planet should be abandoned: {tempCelestial.ToString()}");
+							if (await _ogameService.AbandonCelestial(tempCelestial)) {
+								DoLog(LogLevel.Information, $"Successful Abandon on {tempCelestial.ToString()}.");
+								abandonedCount++;
+								await _tbotOgameBridge.CheckCelestials();
+							} else {
+								DoLog(LogLevel.Debug, $"Failed Abandon on {tempCelestial.ToString()}.");
+							}
+						} else {
+							DoLog(LogLevel.Debug, $"No planet should be abandoned.");
+						}
+					}
+				}
+			} finally {
+				DoLog(LogLevel.Information, $"Abandon-check complete, {abandonedCount} planet(s) abandoned.");
+				_abandonLock.Release();
 			}
 		}
 	}

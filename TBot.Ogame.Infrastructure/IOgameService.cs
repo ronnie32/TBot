@@ -91,6 +91,7 @@ namespace TBot.Ogame.Infrastructure {
 		Task<JumpGateResult> JumpGate(Celestial origin, Celestial destination, Ships ships);
 		Task<bool> SendDiscovery(Celestial origin, Coordinate coords);
 		Task<List<Coordinate>> SendSystemDiscovery(Celestial origin, int galaxy, int system);
+		Task<BoundedDiscoveryResult> SendBoundedSystemDiscovery(Celestial origin, int galaxy, int system, int maxFleets, IReadOnlyList<int> positions);
 		void KillOgamedExecutable(CancellationToken ct = default);
 		Task Login();
 		Task Logout();

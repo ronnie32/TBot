@@ -19,8 +19,57 @@ using Tbot.Common.Settings;
 
 namespace Tbot.Workers {
 	internal class DefenderWorker : WorkerBase {
-		private static readonly ConcurrentDictionary<int, DateTime> _handledAttackIds = new();
+		private readonly ConcurrentDictionary<int, DateTime> _handledAttackIds = new();
 		private static readonly TimeSpan _handledAttackTtl = TimeSpan.FromMinutes(60);
+
+		// Tracks the pending fleetsave for each celestial (keyed by celestial ID), so we only
+		// keep a single scheduled save per celestial and can reschedule it earlier if a faster
+		// attack shows up later.
+		private readonly ConcurrentDictionary<int, ScheduledFleetSave> _scheduledFleetSaves = new();
+
+		private class ScheduledFleetSave {
+			public DateTime ScheduledAtUtc; // when the fleet should actually be sent
+			public DateTime ApproxArrivalUtc; // approximate arrival time of the attack that triggered this schedule
+			public CancellationTokenSource Cts;
+		}
+
+		// Tracks fleet IDs that were sent away by a fleetsave, per celestial, so they can be
+		// recalled once the attacker disappears from the attack list.
+		private readonly ConcurrentDictionary<int, List<int>> _awaySavedFleets = new();
+
+		// Tracks a pending recall per celestial, so we don't schedule the same recall twice and
+		// can cancel it if a new attack shows up before it fires.
+		private readonly ConcurrentDictionary<int, ScheduledRecall> _scheduledRecalls = new();
+
+		private class ScheduledRecall {
+			public DateTime ScheduledAtUtc;
+			public CancellationTokenSource Cts;
+		}
+
+		private readonly object _backgroundLock = new();
+		private readonly List<Task> _backgroundTasks = new();
+
+		private void TrackBackgroundTask(Task task) {
+			lock (_backgroundLock) {
+				_backgroundTasks.RemoveAll(completed => completed.IsCompleted);
+				_backgroundTasks.Add(task);
+			}
+		}
+
+		public override async Task StopWorker() {
+			await base.StopWorker();
+			foreach (var scheduled in _scheduledFleetSaves.Values) {
+				try { scheduled.Cts.Cancel(); } catch (ObjectDisposedException) { }
+			}
+			foreach (var scheduled in _scheduledRecalls.Values) {
+				try { scheduled.Cts.Cancel(); } catch (ObjectDisposedException) { }
+			}
+			Task[] tasks;
+			lock (_backgroundLock) tasks = _backgroundTasks.ToArray();
+			await Task.WhenAll(tasks);
+			lock (_backgroundLock) _backgroundTasks.Clear();
+			_handledAttackIds.Clear();
+		}
 
 		private readonly IFleetScheduler _fleetScheduler;
 		private readonly IOgameService _ogameService;
@@ -51,8 +100,10 @@ namespace Tbot.Workers {
 					foreach (AttackerFleet attack in _tbotInstance.UserData.attacks) {
 						await HandleAttack(attack);
 					}
+					await CheckForFleetsToRecall(_tbotInstance.UserData.attacks);
 				} else {
 					DoLog(LogLevel.Information, "Your empire is safe");
+					await CheckForFleetsToRecall(new List<AttackerFleet>());
 				}
 				long interval = RandomizeHelper.CalcRandomInterval((int) _tbotInstance.InstanceSettings.Defender.CheckIntervalMin, (int) _tbotInstance.InstanceSettings.Defender.CheckIntervalMax);
 				if (interval <= 0)
@@ -237,7 +288,8 @@ namespace Tbot.Workers {
 					}
 					return;
 				}
-				if (attack.Ships != null && _tbotInstance.UserData.researches.EspionageTechnology >= 8) {
+				bool fleetCompositionKnown = attack.Ships != null && _tbotInstance.UserData.researches.EspionageTechnology >= 8;
+				if (fleetCompositionKnown) {
 					if (SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.Defender, "IgnoreProbes") && (bool) _tbotInstance.InstanceSettings.Defender.IgnoreProbes && attack.IsOnlyProbes()) {
 						if (attack.MissionType == Missions.Spy)
 							DoLog(LogLevel.Information, "Attacker sent only Probes! Espionage action skipped.");
@@ -261,6 +313,7 @@ namespace Tbot.Workers {
 				var fleetPoints = attackedCelestial.Ships?.GetFleetPoints() ?? 0;
 
 				if (
+					fleetCompositionKnown &&
 					ignoreAttackIfIHaveActive &&
 					totalResources < (long) _tbotInstance.InstanceSettings.Defender.IgnoreAttackIfIHave.MinResourcesToSave &&
 					(fleetPoints * 1000) < (long) _tbotInstance.InstanceSettings.Defender.IgnoreAttackIfIHave.MinFleetToSave
@@ -334,8 +387,7 @@ namespace Tbot.Workers {
 
 			if ((bool) _tbotInstance.InstanceSettings.Defender.Autofleet.Active) {
 				try {
-					var minFlightTime = attack.ArriveIn + (attack.ArriveIn / 100 * 30) + (RandomizeHelper.CalcRandomInterval(IntervalType.SomeSeconds) / 1000);
-					await _fleetScheduler.AutoFleetSave(attackedCelestial, false, minFlightTime);
+					ScheduleFleetSave(attackedCelestial, attack);
 				} catch (Exception e) {
 					DoLog(LogLevel.Error, $"Could not fleetsave: an exception has occurred: {e.Message}");
 					DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
@@ -344,6 +396,198 @@ namespace Tbot.Workers {
 			} catch (Exception e) {
 				DoLog(LogLevel.Error, $"HandleAttack error for attack {attack?.ID}: {e.Message}");
 				DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
+			}
+		}
+		/// <summary>
+		/// Schedules a fleetsave for the given celestial to be sent 30-60 seconds before the
+		/// attack lands, instead of sending it immediately. If a save is already scheduled for
+		/// this celestial, it is only rescheduled when the new attack arrives earlier than the
+		/// one currently driving the schedule.
+		/// </summary>
+		private void ScheduleFleetSave(Celestial celestial, AttackerFleet attack) {
+			var nowUtc = DateTime.UtcNow;
+			long arriveInSeconds = attack.ArriveIn;
+			int bufferSeconds = new Random().Next(30, 61); // send fleet 30-60s before the attacker lands
+			long sendDelaySeconds = Math.Max(0, arriveInSeconds - bufferSeconds);
+
+			var candidate = new ScheduledFleetSave {
+				ScheduledAtUtc = nowUtc.AddSeconds(sendDelaySeconds),
+				ApproxArrivalUtc = nowUtc.AddSeconds(arriveInSeconds),
+				Cts = CancellationTokenSource.CreateLinkedTokenSource(_ct)
+			};
+
+			bool shouldSchedule = false;
+			ScheduledFleetSave replaced = null;
+
+			_scheduledFleetSaves.AddOrUpdate(celestial.ID,
+				addValueFactory: _ => {
+					shouldSchedule = true;
+					return candidate;
+				},
+				updateValueFactory: (_, existing) => {
+					// Only reschedule if this attack lands earlier than whatever is currently
+					// driving the schedule; a later-arriving attack doesn't need to move anything.
+					if (candidate.ApproxArrivalUtc < existing.ApproxArrivalUtc) {
+						replaced = existing;
+						shouldSchedule = true;
+						return candidate;
+					}
+					shouldSchedule = false;
+					return existing;
+				});
+
+			if (!shouldSchedule) {
+				DoLog(LogLevel.Information, $"Fleetsave for {celestial.ToString()} already scheduled for an earlier or equal arrival; keeping existing schedule.");
+				candidate.Cts.Dispose();
+				return;
+			}
+
+			if (replaced != null) {
+				replaced.Cts.Cancel();
+				replaced.Cts.Dispose();
+			}
+
+			DoLog(LogLevel.Information, $"Scheduling fleetsave for {celestial.ToString()}: attacker arrives in ~{arriveInSeconds}s, fleet will be sent in ~{sendDelaySeconds}s (about {bufferSeconds}s before impact).");
+
+			TrackBackgroundTask(RunScheduledFleetSave(celestial, candidate));
+		}
+
+		private async Task RunScheduledFleetSave(Celestial celestial, ScheduledFleetSave scheduled) {
+			try {
+				var delay = scheduled.ScheduledAtUtc - DateTime.UtcNow;
+				if (delay > TimeSpan.Zero)
+					await Task.Delay(delay, scheduled.Cts.Token);
+
+				if (scheduled.Cts.Token.IsCancellationRequested)
+					return;
+
+				double remainingSeconds = Math.Max(0, (scheduled.ApproxArrivalUtc - DateTime.UtcNow).TotalSeconds);
+				long minFlightTime = (long) (remainingSeconds + (remainingSeconds / 100 * 30) + (RandomizeHelper.CalcRandomInterval(IntervalType.SomeSeconds) / 1000));
+
+				DoLog(LogLevel.Warning, $"Sending fleet away from {celestial.ToString()} ahead of incoming attack.");
+				var confirmedFleetId = await _fleetScheduler.AutoFleetSaveWithResult(celestial, minFlightTime);
+				if (confirmedFleetId > 0) {
+					var savedFleetId = confirmedFleetId.Value;
+					_awaySavedFleets.AddOrUpdate(celestial.ID,
+						_ => new List<int> { savedFleetId },
+						(_, existing) => existing.Union(new[] { savedFleetId }).ToList());
+					DoLog(LogLevel.Information, $"Tracking confirmed defensive fleet {savedFleetId} from {celestial.ToString()} for later recall.");
+				} else {
+					DoLog(LogLevel.Warning, $"Fleetsave triggered for {celestial.ToString()} but returned no confirmed fleet ID; recall tracking skipped.");
+				}
+			} catch (TaskCanceledException) {
+				DoLog(LogLevel.Information, $"Scheduled fleetsave for {celestial.ToString()} was cancelled (superseded by an earlier-arriving attack, or the bot is shutting down).");
+			} catch (Exception e) {
+				DoLog(LogLevel.Error, $"Could not fleetsave: an exception has occurred: {e.Message}");
+				DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
+			} finally {
+				// Only remove the entry if it still points at this exact scheduled instance -
+				// avoids clobbering a newer schedule that superseded this one.
+				_scheduledFleetSaves.TryRemove(new KeyValuePair<int, ScheduledFleetSave>(celestial.ID, scheduled));
+				scheduled.Cts.Dispose();
+	}
+}
+
+		/// <summary>
+		/// Goes through every celestial that currently has fleets away on a defensive save and
+		/// checks whether the attacker is still present in the current attack list. If not,
+		/// schedules a recall; if a new attack just showed up on a celestial with a pending
+		/// recall, cancels that recall so the fleet stays away.
+		/// </summary>
+		private async Task CheckForFleetsToRecall(List<AttackerFleet> currentAttacks) {
+			if (_awaySavedFleets.IsEmpty)
+				return;
+
+			foreach (var celestialId in _awaySavedFleets.Keys.ToArray()) {
+				Celestial celestial = _tbotInstance.UserData.celestials.Unique().FirstOrDefault(c => c.ID == celestialId);
+				if (celestial == null)
+					continue;
+
+				bool stillTargeted = currentAttacks != null && currentAttacks.Any(a => celestial.HasCoords(a.Destination));
+				if (stillTargeted) {
+					if (_scheduledRecalls.TryRemove(celestialId, out var pending)) {
+						pending.Cts.Cancel();
+						pending.Cts.Dispose();
+						DoLog(LogLevel.Information, $"Cancelled pending recall for {celestial.ToString()}: attacker is back.");
+					}
+					continue;
+				}
+
+				ScheduleFleetRecall(celestial);
+			}
+			await Task.CompletedTask;
+		}
+
+		/// <summary>
+		/// Schedules a recall of the fleet(s) previously saved from this celestial, after a short
+		/// random delay, so a fresh attack has a moment to cancel the recall before it fires.
+		/// </summary>
+		private void ScheduleFleetRecall(Celestial celestial) {
+			if (_scheduledRecalls.ContainsKey(celestial.ID))
+				return; // a recall is already pending for this celestial
+
+			int delaySeconds = new Random().Next(30, 91);
+			var scheduled = new ScheduledRecall {
+				ScheduledAtUtc = DateTime.UtcNow.AddSeconds(delaySeconds),
+				Cts = CancellationTokenSource.CreateLinkedTokenSource(_ct)
+			};
+
+			if (!_scheduledRecalls.TryAdd(celestial.ID, scheduled)) {
+				scheduled.Cts.Dispose();
+				return; // another thread beat us to scheduling it
+			}
+
+			DoLog(LogLevel.Information, $"Attacker gone from {celestial.ToString()}; recalling saved fleet(s) in ~{delaySeconds}s.");
+			TrackBackgroundTask(RunScheduledRecall(celestial, scheduled));
+		}
+
+		private async Task RunScheduledRecall(Celestial celestial, ScheduledRecall scheduled) {
+			try {
+				var delay = scheduled.ScheduledAtUtc - DateTime.UtcNow;
+				if (delay > TimeSpan.Zero)
+					await Task.Delay(delay, scheduled.Cts.Token);
+
+				if (scheduled.Cts.Token.IsCancellationRequested)
+					return;
+
+				// Re-check right before recalling: make sure nothing new has targeted this
+				// celestial while we were waiting out the delay.
+				var freshAttacks = await _ogameService.GetAttacks();
+				if (freshAttacks != null && freshAttacks.Any(a => celestial.HasCoords(a.Destination))) {
+					DoLog(LogLevel.Information, $"Recall for {celestial.ToString()} aborted: a new attack showed up before the recall fired.");
+					return;
+				}
+
+				if (!_awaySavedFleets.TryRemove(celestial.ID, out var fleetIds) || fleetIds == null || fleetIds.Count == 0)
+					return;
+
+				_tbotInstance.UserData.fleets = await _fleetScheduler.UpdateFleets();
+				foreach (var fleetId in fleetIds) {
+					var fleet = _tbotInstance.UserData.fleets.SingleOrDefault(f => f.ID == fleetId);
+					if (fleet == null) {
+						DoLog(LogLevel.Information, $"Saved fleet {fleetId} from {celestial.ToString()} is no longer active (already returned or landed); nothing to recall.");
+						continue;
+					}
+					if (fleet.ReturnFlight) {
+						DoLog(LogLevel.Information, $"Saved fleet {fleetId} from {celestial.ToString()} is already on its way back; nothing to recall.");
+						continue;
+					}
+					try {
+						DoLog(LogLevel.Warning, $"Recalling saved fleet {fleetId} back to {celestial.ToString()}.");
+						await _fleetScheduler.CancelFleet(fleet);
+					} catch (Exception e) {
+						DoLog(LogLevel.Error, $"Could not recall fleet {fleetId}: an exception has occurred: {e.Message}");
+						DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
+					}
+				}
+			} catch (TaskCanceledException) {
+				DoLog(LogLevel.Information, $"Scheduled recall for {celestial.ToString()} was cancelled.");
+			} catch (Exception e) {
+				DoLog(LogLevel.Error, $"Could not process scheduled recall: an exception has occurred: {e.Message}");
+				DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
+			} finally {
+				_scheduledRecalls.TryRemove(new KeyValuePair<int, ScheduledRecall>(celestial.ID, scheduled));
+				scheduled.Cts.Dispose();
 			}
 		}
 	}

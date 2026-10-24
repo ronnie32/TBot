@@ -104,9 +104,10 @@ namespace Tbot {
 			
 
 			Console.CancelKeyPress += (sender, e) => {
+				e.Cancel = true;
 				_logger.WriteLog(LogLevel.Information, LogSender.Main, "CTRL+C pressed!");
 				cts.Cancel();
-				tcs.SetResult();
+				tcs.TrySetResult();
 			};
 
 			// Manage WebUI

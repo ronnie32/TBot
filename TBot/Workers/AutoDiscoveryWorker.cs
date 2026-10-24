@@ -280,10 +280,8 @@ namespace Tbot.Workers {
 			if (dispatchLimit <= 0)
 				return DiscoveryOriginAttemptResult.Stopped;
 
-			// The system endpoint is deliberately used only when the worker's plan is
-			// the complete set returned by the system view. The endpoint has no per-
-			// request limit and therefore must never be used when a blacklisted or
-			// already-passed position could still be returned by OGame.
+			// Preserve the system-first planner while binding the server action to
+			// this exact set of positions and this cycle's reserved slot count.
 			bool canUseSystemDispatch = plannedPositions.Count <= dispatchLimit &&
 				plannedPositions.Count == availablePositions.Count &&
 				availablePositions.All(position => position >= (isCursorSystem ? cursor.NextPosition : 1)) &&
@@ -296,11 +294,10 @@ namespace Tbot.Workers {
 
 				DiscoverySystemDispatchResult systemResult;
 				try {
-					// The system endpoint is the normal path: OGame already knows all
-					// free positions in this system, so one request can dispatch the
-					// complete system without touching every origin or position.
+					// Only the reserved coordinates may be sent, even if eligibility
+					// changes after this view was read.
 					systemResult = await _fleetScheduler.SendSystemDiscovery(
-						origin, origin.Coordinate.Galaxy, systemToDo, plannedPositions.Count);
+						origin, origin.Coordinate.Galaxy, systemToDo, plannedPositions.Count, plannedPositions);
 				} catch (Exception e) {
 					systemResult = new DiscoverySystemDispatchResult(
 						DiscoveryDispatchStatus.Failed,
@@ -332,7 +329,7 @@ namespace Tbot.Workers {
 				}
 
 				ctx.Record(systemResult.Status, systemResult.IsConfirmed ? confirmed.Count : 1);
-				if (systemResult.IsConfirmed && confirmed.Count > 0) {
+				if (confirmed.Count > 0) {
 					if (confirmed.Count != plannedPositions.Count)
 						DoLog(LogLevel.Warning,
 							$"Discovery system {origin.Coordinate.Galaxy}:{systemToDo} confirmed {confirmed.Count}/{plannedPositions.Count} planned positions; leaving the cursor recoverable for the next cycle.");
@@ -355,6 +352,10 @@ namespace Tbot.Workers {
 					ctx.DiscoveriesRemaining -= confirmed.Count;
 					DoLog(LogLevel.Information,
 						$"Discovery system {origin.Coordinate.Galaxy}:{systemToDo} dispatched {confirmed.Count} fleet(s) from {origin}.");
+					if (!systemResult.IsConfirmed || confirmed.Count != plannedPositions.Count) {
+						ctx.Stop = true;
+						return DiscoveryOriginAttemptResult.Stopped;
+					}
 					return DiscoveryOriginAttemptResult.Sent;
 				}
 

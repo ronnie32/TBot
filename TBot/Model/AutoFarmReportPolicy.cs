@@ -57,6 +57,9 @@ namespace TBot.Model {
 			if (report == null)
 				return new(AutoFarmReportDecisionKind.NotSuitable, "MissingReport");
 
+			if (report.HasInvalidThreatCounts())
+				return new(AutoFarmReportDecisionKind.NotSuitable, "MalformedThreatCount");
+
 			var loot = report.Loot(playerClass);
 			var meetsMinimum = preferredResource switch {
 				"Metal" => loot.Metal > minimumResources,

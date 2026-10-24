@@ -94,24 +94,23 @@ namespace Tbot.Common.Settings {
 		}
 
 		private class SettingsSemaphoreManager {
-			private readonly SemaphoreSlim _dictSemaphore;
+			private readonly object _dictLock = new();
 			private readonly Dictionary<string, AsyncReaderWriterLock> _settingsSemaphores;
 
 			public SettingsSemaphoreManager() {
-				_settingsSemaphores = new Dictionary<string, AsyncReaderWriterLock>();
-				_dictSemaphore = new SemaphoreSlim(1, 1);
+				_settingsSemaphores = new Dictionary<string, AsyncReaderWriterLock>(
+					OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 			}
 
 			public AsyncReaderWriterLock GetSemaphore(string settingsPath) {
-				if (!_settingsSemaphores.ContainsKey(settingsPath)) {
-
-					_dictSemaphore.Wait();
-					if (!_settingsSemaphores.ContainsKey(settingsPath)) {
-						_settingsSemaphores.Add(settingsPath, new AsyncReaderWriterLock());
+				string normalizedPath = Path.GetFullPath(settingsPath);
+				lock (_dictLock) {
+					if (!_settingsSemaphores.TryGetValue(normalizedPath, out var semaphore)) {
+						semaphore = new AsyncReaderWriterLock();
+						_settingsSemaphores.Add(normalizedPath, semaphore);
 					}
-					_dictSemaphore.Release();
+					return semaphore;
 				}
-				return _settingsSemaphores[settingsPath];
 			}
 		}
 

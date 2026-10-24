@@ -1732,12 +1732,13 @@ namespace Tbot.Workers {
 				StringComparison.OrdinalIgnoreCase);
 		}
 
-		private async Task<List<EspionageReportSummary>> GetEspionageReportSummariesForProcessing() {
+		private async Task<(List<EspionageReportSummary> Summaries, bool Complete)> GetEspionageReportSummariesForProcessing() {
 			const int maxPages = 100;
 			var summaries = new List<EspionageReportSummary>();
 			var seenReportIds = new HashSet<int>();
 			bool processAllReports = IsProcessAllReportsEnabled();
 			bool reachedSafetyLimit = true;
+			bool complete = true;
 
 			for (int page = 1; page <= maxPages; page++) {
 				var pageReports = await _ogameService.GetEspionageReportsPage(page)
@@ -1774,6 +1775,7 @@ namespace Tbot.Workers {
 				// same complete list for every page. Do not loop forever in that case.
 				if (!addedNewReport) {
 					reachedSafetyLimit = false;
+					complete = false;
 					_tbotInstance.log(LogLevel.Debug, LogSender.AutoFarm,
 						$"Report page {page} contained no new report IDs; stopping pagination.");
 					break;
@@ -1784,7 +1786,7 @@ namespace Tbot.Workers {
 				_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm,
 					$"AutoFarm report pagination reached the safety limit of {maxPages} pages.");
 
-			return summaries;
+			return (summaries, complete && !reachedSafetyLimit);
 		}
 
 		private async Task<(bool Continue, bool CleanupSucceeded)> ProcessEspionageReportSummary(
@@ -1814,11 +1816,20 @@ namespace Tbot.Workers {
 				return (false, deleted);
 			}
 
+
 			var report = await _ogameService.GetEspionageReport(summary.ID);
+			// Scope must be established before age/malformed cleanup. Manual reports
+			// may be expired too, but owned-only AutoFarm must leave them alone.
+			if (!processAllReports) {
+				var summaryTarget = summary.Target == null ? null :
+					(_tbotInstance.UserData.farmTargets ?? new List<FarmTarget>())
+						.FirstOrDefault(target => target?.HasCoords(summary.Target) == true);
+				if (!AutoFarmReportPolicy.IsOwnedByAutoFarm(summaryTarget,
+					new EspionageReport { ID = summary.ID }, false))
+					return (true, true);
+			}
 			if (report == null || report.ID <= 0 || report.Coordinate == null) {
-				var malformedReport = report ?? new EspionageReport { ID = summary.ID };
-				if (malformedReport.ID <= 0)
-					malformedReport.ID = summary.ID;
+				var malformedReport = new EspionageReport { ID = summary.ID, Coordinate = summary.Target };
 				RecordProcessedReport(malformedReport, "Malformed");
 				_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm,
 					$"Ignoring malformed espionage report {summary.ID}: no coordinate was returned.");
@@ -1838,6 +1849,15 @@ namespace Tbot.Workers {
 				!(processAllReports && IsMarkedAsNotScanned(report.ID))) {
 				var knownDeleted = await TryDeleteEspionageReport(report.ID, "already consumed");
 				return (false, knownDeleted);
+			}
+
+			if (!processAllReports) {
+				var ownedTarget = (_tbotInstance.UserData.farmTargets ?? new List<FarmTarget>())
+					.FirstOrDefault(target => target?.HasCoords(report.Coordinate) == true);
+				if (!AutoFarmReportPolicy.IsOwnedByAutoFarm(ownedTarget, report, false)) {
+					RecordProcessedReport(report, "NotScanned");
+					return (true, true);
+				}
 			}
 
 			if (AutoFarmReportPolicy.IsExpired(report.Date, serverNowUtc, GetReportCooldown())) {
@@ -1908,74 +1928,40 @@ namespace Tbot.Workers {
 		}
 
 		private async Task<bool> AutoFarmProcessReports() {
-			const int maxPages = 100;
-			var seenReportIds = new HashSet<int>();
-			var allReportsProcessed = true;
-			var processAllReports = IsProcessAllReportsEnabled();
-
+			// Snapshot every required summary page before deleting any report: deleting
+			// page one changes the offsets of all later mailbox pages.
+			(List<EspionageReportSummary> Summaries, bool Complete) traversal;
 			DateTime serverNowUtc;
 			try {
 				serverNowUtc = await GetServerTimeUtc();
+				traversal = await GetEspionageReportSummariesForProcessing();
 			} catch (Exception e) {
 				_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm,
-					$"Unable to determine report age; report processing will be retried: {e.Message}");
+					$"Unable to snapshot espionage reports; keeping the report phase pending: {e.Message}");
 				return false;
 			}
-
-			for (var page = 1; page <= maxPages; page++) {
-				List<EspionageReportSummary> pageReports;
-				try {
-					pageReports = await _ogameService.GetEspionageReportsPage(page)
-						?? new List<EspionageReportSummary>();
-				} catch (Exception e) {
-					_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm,
-						$"Unable to retrieve espionage reports page {page}; keeping the report phase pending: {e.Message}");
-					return false;
-				}
-
-				if (pageReports.Count == 0)
-					break;
-
-				var addedNewReport = false;
-				foreach (var summary in pageReports) {
-					if (summary == null || summary.ID <= 0 || !seenReportIds.Add(summary.ID))
-						continue;
-
-					addedNewReport = true;
-					if (summary.Type == EspionageReportType.Action)
-						continue;
-
+			var complete = traversal.Complete;
+			var processAllReports = IsProcessAllReportsEnabled();
+			foreach (var summary in traversal.Summaries) {
 					try {
 						var result = await ProcessEspionageReportSummary(summary, processAllReports, serverNowUtc);
-						allReportsProcessed = AutoFarmReportPolicy.CombineProcessingResult(
-							allReportsProcessed,
-							result.CleanupSucceeded);
-						if (!result.Continue)
-							return allReportsProcessed;
+					complete &= result.CleanupSucceeded;
+					if (!result.Continue) return complete;
 					} catch (OperationCanceledException) when (_ct.IsCancellationRequested) {
 						throw;
 					} catch (Exception e) {
-						allReportsProcessed = false;
+					complete = false;
 						_tbotInstance.log(LogLevel.Error, LogSender.AutoFarm,
 							$"AutoFarm report {summary.ID} could not be processed: {e.Message}");
-						_tbotInstance.log(LogLevel.Debug, LogSender.AutoFarm, e.StackTrace);
 					}
 				}
-
-				if (!addedNewReport) {
-					_tbotInstance.log(LogLevel.Debug, LogSender.AutoFarm,
-						$"Report page {page} contained no new report IDs; stopping pagination.");
-					break;
-				}
-			}
-
-			return allReportsProcessed;
+			return complete;
 		}
 
 		private async Task<bool> AutoFarmProcessReportsLegacy() {
 			List<EspionageReportSummary> summaryReports;
 			try {
-				summaryReports = await GetEspionageReportSummariesForProcessing();
+				summaryReports = (await GetEspionageReportSummariesForProcessing()).Summaries;
 			} catch (Exception e) {
 				// Report cleanup is best effort. A temporary OGame/API failure must not
 				// prevent the attack phase from processing targets already marked pending.

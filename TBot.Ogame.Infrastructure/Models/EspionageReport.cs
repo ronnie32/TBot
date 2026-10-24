@@ -184,8 +184,16 @@ namespace TBot.Ogame.Infrastructure.Models {
 				pathfinder: Pathfinder.GetValueOrDefault()).GetFleetPoints();
 		}
 
+		public bool HasInvalidThreatCounts() => new long?[] {
+			SolarSatellite, LightFighter, HeavyFighter, Cruiser, Battleship, Battlecruiser,
+			Bomber, Destroyer, Deathstar, SmallCargo, LargeCargo, ColonyShip, Recycler,
+			EspionageProbe, Crawler, Reaper, Pathfinder, RocketLauncher, LightLaser,
+			HeavyLaser, GaussCannon, IonCannon, PlasmaTurret, SmallShieldDome,
+			LargeShieldDome, AntiBallisticMissiles, InterplanetaryMissiles
+		}.Any(amount => amount < 0);
+
 		private static bool HasShipOrDefence(params long?[] amounts) {
-			return amounts.Any(amount => amount.GetValueOrDefault() > 0);
+			return amounts.Any(amount => amount.GetValueOrDefault() != 0);
 		}
 
 		/// <summary>

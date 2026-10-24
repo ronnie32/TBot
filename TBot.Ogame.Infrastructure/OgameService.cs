@@ -63,7 +63,7 @@ namespace TBot.Ogame.Infrastructure {
 
 			_ogamedProcess = ExecuteOgamedExecutable(credentials, device, host, port, captchaKey, proxySettings);
 
-			_client = new HttpClient() {
+			_client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) {
 				BaseAddress = new Uri($"http://{host}:{port}/"),
 				Timeout = TimeSpan.FromSeconds(60)
 			};
@@ -311,7 +311,11 @@ namespace TBot.Ogame.Infrastructure {
 			var response = retry
 				? await GetRetryPolicy().ExecuteAsync(send)
 				: await send();
-			return await ManageResponse<T>(response);
+			T result;
+			try { result = await ManageResponse<T>(response); }
+			catch (OgamedException e) { e.StatusCode = response.StatusCode; throw; }
+			if (!retry) response.EnsureSuccessStatusCode();
+			return result;
 		}
 
 		public async Task SetUserAgent(string userAgent) {
@@ -908,7 +912,9 @@ namespace TBot.Ogame.Infrastructure {
 				parameters.Add(new KeyValuePair<string, string>("deuterium", payload.Deuterium.ToString()));
 				parameters.Add(new KeyValuePair<string, string>("food", payload.Food.ToString()));
 
-				return await PostAsync<Fleet>($"/bot/planets/{origin.ID}/send-fleet", parameters.ToArray());
+				var fleet = await PostAsyncNoRetry<Fleet>($"/bot/planets/{origin.ID}/send-fleet", parameters.ToArray());
+				if (fleet == null) throw new InvalidOperationException("Fleet response contains no movement.");
+				return fleet;
 			} catch (OgamedException e) when (e.Message.Contains("no ships to send")) {
 				return null;
 			}
@@ -1057,6 +1063,16 @@ namespace TBot.Ogame.Infrastructure {
 			// request before the transport reported the failure. The wrapper is
 			// responsible for reconciling its own ambiguous OGame response.
 			return await PostAsyncNoRetry<bool>($"/bot/planets/{origin.ID}/send-discovery", parameters.ToArray());
+		}
+
+		public async Task<BoundedDiscoveryResult> SendBoundedSystemDiscovery(Celestial origin, int galaxy, int system, int maxFleets, IReadOnlyList<int> positions) {
+			if (origin == null || galaxy <= 0 || system <= 0 || maxFleets <= 0 || maxFleets > 15 ||
+				positions == null || positions.Count == 0 || positions.Count > maxFleets ||
+				positions.Any(position => position < 1 || position > 15) || positions.Distinct().Count() != positions.Count)
+				throw new ArgumentException("A bounded discovery request requires unique reserved positions and a valid maximum fleet count.");
+			return await PostAsyncNoRetry<BoundedDiscoveryResult>($"/bot/planets/{origin.ID}/send-system-discovery-bounded",
+				new("galaxy", galaxy.ToString()), new("system", system.ToString()),
+				new("maxFleets", maxFleets.ToString()), new("positions", string.Join(",", positions)));
 		}
 
 		public async Task<List<Coordinate>> SendSystemDiscovery(Celestial origin, int galaxy, int system) {

@@ -187,8 +187,10 @@ namespace TBot.Tests {
 				DeleteDataFile($"autodiscovery_artifacts_{alias}.json");
 			}
 		}
-		[Fact]
-		public async Task UsesOneSystemDispatchForAllAvailablePositionsBeforeMovingOn() {
+		[Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+		public async Task UsesOneSystemDispatchForAllAvailablePositionsBeforeMovingOn(bool partial) {
 			var alias = $"autodiscovery-{Guid.NewGuid():N}";
 			var origin = new Planet {
 				ID = 110,
@@ -244,7 +246,7 @@ namespace TBot.Tests {
 			});
 			var scheduler = Proxy<IFleetScheduler>.Create((method, args) => method.Name switch {
 				nameof(IFleetScheduler.UpdateFleets) => Task.FromResult(new List<Fleet>()),
-				nameof(IFleetScheduler.SendSystemDiscovery) => SendSystemDiscovery(args, systemDispatches, available),
+				nameof(IFleetScheduler.SendSystemDiscovery) => SendSystemDiscovery(args, systemDispatches, partial ? available.Take(1).ToList() : available, partial),
 				nameof(IFleetScheduler.SendDiscovery) => SendUnexpectedIndividualDiscovery(args, individualDispatches),
 				_ => Proxy<IFleetScheduler>.Default(method.ReturnType)
 			});
@@ -260,6 +262,11 @@ namespace TBot.Tests {
 				Assert.Single(systemDispatches);
 				Assert.Equal((1, 30, 3), systemDispatches[0]);
 				Assert.Empty(individualDispatches);
+                if (partial) {
+                    var check = typeof(AutoDiscoveryWorker).GetMethod("IsBlacklistedAndActive", BindingFlags.Instance | BindingFlags.NonPublic);
+                    Assert.True((bool)check.Invoke(worker, new object[] { available[0], DateTime.UtcNow }));
+                    Assert.False((bool)check.Invoke(worker, new object[] { available[1], DateTime.UtcNow }));
+                }
 			} finally {
 				var cursorPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", $"autodiscovery_cursors_{alias}.json");
 				if (System.IO.File.Exists(cursorPath))
@@ -710,9 +717,11 @@ namespace TBot.Tests {
 			return Task.FromResult(new DiscoveryDispatchResult(DiscoveryDispatchStatus.Sent, "sent"));
 		}
 
-		private static Task<DiscoverySystemDispatchResult> SendSystemDiscovery(object[] args, List<(int galaxy, int system, int expected)> dispatches, List<Coordinate> coordinates) {
+		private static Task<DiscoverySystemDispatchResult> SendSystemDiscovery(object[] args, List<(int galaxy, int system, int expected)> dispatches, List<Coordinate> coordinates, bool partial = false) {
+            Assert.Equal(5, args.Length);
+            Assert.Equal((int)args[3], ((IReadOnlyList<int>)args[4]).Count);
 			dispatches.Add(((int)args[1], (int)args[2], (int)args[3]));
-			return Task.FromResult(new DiscoverySystemDispatchResult(DiscoveryDispatchStatus.Sent, coordinates, "sent"));
+			return Task.FromResult(new DiscoverySystemDispatchResult(partial ? DiscoveryDispatchStatus.Failed : DiscoveryDispatchStatus.Sent, coordinates, "sent"));
 		}
 
 		private static Task<DiscoverySystemDispatchResult> SendSystemDiscoveryForOrigins(object[] args, List<int> attemptedOrigins) {

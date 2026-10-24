@@ -72,7 +72,7 @@ namespace Tbot.Workers {
 		public async Task StartWorker(CancellationToken ct, TimeSpan dueTime) {
 			await StartWorker(ct, Timeout.InfiniteTimeSpan, dueTime);
 		}
-		public async Task StopWorker() {
+		public virtual async Task StopWorker() {
 			// Stop also all the timers
 			RemoveAllTimers();
 			if (_timer != null) {
