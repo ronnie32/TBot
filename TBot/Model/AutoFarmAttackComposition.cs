@@ -25,12 +25,12 @@ namespace TBot.Model {
 				return ships;
 
 			if (attackDefendedTargets) {
-				var defensePoints = report.GetDefensePoints(includeMissiles: !ignoreMissiles);
+				var defensePoints = report.GetDefenseResourceValue(includeMissiles: !ignoreMissiles);
 				ships.Add(Buildables.Bomber, CalculateEscortCount(defensePoints, bombersPer100kDefense));
 			}
 
 			if (attackTargetsWithFleet)
-				ships.Add(Buildables.Reaper, CalculateEscortCount(report.GetFleetPoints(), reapersPer100kFleet));
+				ships.Add(Buildables.Reaper, CalculateEscortCount(report.GetFleetResourceValue(), reapersPer100kFleet));
 
 			return ships;
 		}

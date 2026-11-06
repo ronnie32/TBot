@@ -22,7 +22,7 @@ namespace TBot.Tests {
 		}
 
 		[Fact]
-		public void DefenseAndFleetLimitsAreAppliedInOgamePoints() {
+		public void DefenseAndFleetLimitsAreAppliedInResourceValue() {
 			var report = new EspionageReport {
 				Metal = 1000000,
 				HasFleetInformation = true,
@@ -33,19 +33,19 @@ namespace TBot.Tests {
 
 			var decision = AutoFarmReportPolicy.Evaluate(
 				report, 0, "", default, true, true, true,
-				report.GetDefensePoints(false), report.GetFleetPoints());
+				20_000, 160_000);
 
 			Assert.Equal(AutoFarmReportDecisionKind.AttackPending, decision.Kind);
 
 			var defenseTooLarge = AutoFarmReportPolicy.Evaluate(
 				report, 0, "", default, true, true, true,
-				report.GetDefensePoints(false) - 1, 0);
+				19_999, 0);
 			Assert.Equal(AutoFarmReportDecisionKind.NotSuitable, defenseTooLarge.Kind);
 			Assert.Equal("DefenseLimitExceeded", defenseTooLarge.Reason);
 
 			var fleetTooLarge = AutoFarmReportPolicy.Evaluate(
 				report, 0, "", default, true, true, true,
-				0, report.GetFleetPoints() - 1);
+				0, 159_999);
 			Assert.Equal(AutoFarmReportDecisionKind.NotSuitable, fleetTooLarge.Kind);
 			Assert.Equal("FleetLimitExceeded", fleetTooLarge.Reason);
 		}
@@ -62,6 +62,16 @@ namespace TBot.Tests {
 				report, 0, "", default, true, true, true, 0, 0);
 
 			Assert.Equal(AutoFarmReportDecisionKind.NeedMoreInformation, decision.Kind);
+		}
+
+		[Fact]
+		public void MissileResourceValuesAreIncludedOnlyWhenRequested() {
+			var report = new EspionageReport {
+				RocketLauncher = 1, AntiBallisticMissiles = 1, InterplanetaryMissiles = 1
+			};
+
+			Assert.Equal(37_000, report.GetDefenseResourceValue());
+			Assert.Equal(2_000, report.GetDefenseResourceValue(includeMissiles: false));
 		}
 	}
 }

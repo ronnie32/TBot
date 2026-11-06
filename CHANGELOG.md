@@ -1,5 +1,21 @@
 # Changelog
 
+## v3.5.1-beta3
+
+> **Beta release:** This release fixes AutoFarm pending attacks, escort sizing, point limits and defense report retention.
+
+### Fixed
+
+#### AutoFarm
+
+- Fixed pending attacks being delayed by a new galaxy scan after fleet slots run out. Pending targets now resume before scanning, including after a worker restart, and `StopAfterFullScan` waits until they have been dispatched.
+- Fixed bomber and reaper escort sizing using OGame score instead of resource value (metal + crystal + deuterium). A fleet worth 37,000,000 resources now requests 740 reapers with `ReapersPer100kFleet: 2`.
+- Fixed `MaxDefensePoints` and `MaxFleetPoints` to use the same resource values as escort sizing. Pending targets are checked against the current limits again before dispatch.
+- Fixed `KeepReportsWithDefense` preserving low-resource reports. Reports are kept only when their loot exceeds `MinimumResources`, respecting `PreferedResource`, including previously cached retention decisions.
+
+Build version: **3.5.1.3**
+Release channel: **Beta**
+
 ## v3.5.1-beta2
 
 > **Beta release:** This is a focused fix for AutoFarm cargo calculation.

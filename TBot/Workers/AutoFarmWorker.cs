@@ -257,7 +257,7 @@ namespace Tbot.Workers {
 				(bool) _tbotInstance.InstanceSettings.AutoFarm.KeepReportsWithDefense;
 		}
 
-		private bool IsManualReviewDefenseReport(int reportId) {
+		private async Task<bool> IsManualReviewDefenseReport(int reportId) {
 			if (reportId <= 0)
 				return false;
 
@@ -266,13 +266,22 @@ namespace Tbot.Workers {
 			if (target?.Report != null)
 				return ShouldPreserveDefenseReport(target.Report);
 
-			return KeepReportsWithDefenseEnabled() &&
-				AutoFarmReportPolicy.IsManualReviewDefense(_stateStore.GetProcessedReportOutcome(reportId));
+			if (!KeepReportsWithDefenseEnabled() ||
+				!AutoFarmReportPolicy.IsManualReviewDefense(_stateStore.GetProcessedReportOutcome(reportId)))
+				return false;
+
+			// A cached outcome alone contains no loot amounts. Re-read external
+			// reports so old retention decisions also obey the current threshold.
+			return ShouldPreserveDefenseReport(await _ogameService.GetEspionageReport(reportId));
 		}
 
 		private bool ShouldPreserveDefenseReport(EspionageReport report) {
 			if (!KeepReportsWithDefenseEnabled() || report == null ||
-				!report.HasDefensiveStructures(!IgnoreMissiles()))
+				!report.HasDefensiveStructures(!IgnoreMissiles()) ||
+				!AutoFarmReportPolicy.MeetsMinimumResources(report,
+					GetAutoFarmLong("MinimumResources", 1000000),
+					Convert.ToString(_tbotInstance.InstanceSettings.AutoFarm.PreferedResource) ?? string.Empty,
+					_tbotInstance.UserData.userInfo.Class))
 				return false;
 
 			// Explicit automated-defense mode takes precedence over manual retention,
@@ -281,7 +290,7 @@ namespace Tbot.Workers {
 				return true;
 
 			var maxDefensePoints = GetAutoFarmLong("MaxDefensePoints", 0);
-			return maxDefensePoints > 0 && report.GetDefensePoints(!IgnoreMissiles()) > maxDefensePoints;
+			return maxDefensePoints > 0 && report.GetDefenseResourceValue(!IgnoreMissiles()) > maxDefensePoints;
 		}
 
 		private void PreserveReportForManualReview(EspionageReport report, bool processAllReports) {
@@ -890,7 +899,10 @@ namespace Tbot.Workers {
 
 						int numProbed = 0;
 
-						if (_tbotInstance.UserData.autoFarmReportPhasePending) {
+						if (_tbotInstance.UserData.farmTargets.Any(target => target.State == FarmState.AttackPending)) {
+							_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+								"Resuming pending attacks before scanning more systems.");
+						} else if (_tbotInstance.UserData.autoFarmReportPhasePending) {
 							_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
 								"A previous full scan is awaiting report processing; skipping the galaxy scan until the report phase succeeds.");
 						} else {
@@ -1227,11 +1239,6 @@ namespace Tbot.Workers {
 					_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, "Processing espionage reports of found inactives...");
 
 					reportPhaseCompleted = await AutoFarmProcessReports();
-					if (AutoFarmCyclePolicy.CanFinalizeFullScan(finishedFullScan, reportPhaseCompleted)) {
-						SaveScanCursor(0, 0, 0);
-						_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
-							"Report processing completed; scan position reset for next cycle");
-					}
 					PersistTargets();
 
 					_tbotInstance.UserData.slots = await _tbotOgameBridge.UpdateSlots();
@@ -1332,6 +1339,11 @@ namespace Tbot.Workers {
 							continue;
 						}
 						var loot = target.Report.Loot(_tbotInstance.UserData.userInfo.Class);
+						if (EvaluateReport(target.Report).Kind != AutoFarmReportDecisionKind.AttackPending) {
+							ApplyReportDecision(target, target.Report);
+							PersistTargets();
+							continue;
+						}
 						var numCargo = 0L;
 						var attackingShips = new Ships();
 
@@ -1617,8 +1629,13 @@ namespace Tbot.Workers {
 				_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm, $"Stacktrace: {e.StackTrace}");
 			} finally {
 				PersistTargets();
-				if (stopAfterFullScan && AutoFarmCyclePolicy.CanFinalizeFullScan(finishedFullScan, reportPhaseCompleted)) {
-					stop = true;
+				if (AutoFarmCyclePolicy.CanFinalizeFullScan(finishedFullScan, reportPhaseCompleted,
+					_tbotInstance.UserData.farmTargets.Any(target => target.State == FarmState.AttackPending))) {
+					SaveScanCursor(0, 0, 0);
+					_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+						"Report processing and attack dispatch completed; scan position reset for next cycle.");
+					if (stopAfterFullScan)
+						stop = true;
 				}
 
 				_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, $"Attacked targets: {_tbotInstance.UserData.farmTargets.Where(t => t.State == FarmState.AttackSent).Count()}");
@@ -1756,7 +1773,7 @@ namespace Tbot.Workers {
 					addedNewReport = true;
 					summaries.Add(summary);
 					if (IsKnownAutoFarmReport(summary.ID)
-						&& !IsManualReviewDefenseReport(summary.ID)
+						&& !(await IsManualReviewDefenseReport(summary.ID))
 						&& !IsPreservedOutsideConfiguredRange(summary.ID, processAllReports)
 						&& !(processAllReports && IsMarkedAsNotScanned(summary.ID))) {
 						reachedKnownBoundary = true;
@@ -1794,7 +1811,7 @@ namespace Tbot.Workers {
 			if (summary == null || summary.ID <= 0 || summary.Type == EspionageReportType.Action)
 				return (true, true);
 
-			if (IsManualReviewDefenseReport(summary.ID)) {
+			if (await IsManualReviewDefenseReport(summary.ID)) {
 				_tbotInstance.log(LogLevel.Debug, LogSender.AutoFarm,
 					$"Skipping preserved espionage report {summary.ID}: planetary defenses are reserved for manual review.");
 				return (true, true);
@@ -1831,7 +1848,7 @@ namespace Tbot.Workers {
 				return (true, true);
 			}
 
-			if (IsManualReviewDefenseReport(report.ID))
+			if (await IsManualReviewDefenseReport(report.ID))
 				return (true, true);
 
 			if (IsKnownAutoFarmReport(report.ID) &&
@@ -2004,7 +2021,7 @@ namespace Tbot.Workers {
 				.GroupBy(report => report.ID)
 				.Select(group => group.First())) {
 				try {
-					if (IsManualReviewDefenseReport(summary.ID)) {
+					if (await IsManualReviewDefenseReport(summary.ID)) {
 						_tbotInstance.log(LogLevel.Debug, LogSender.AutoFarm,
 							$"Skipping preserved espionage report {summary.ID}: planetary defenses are reserved for manual review.");
 						continue;
@@ -2053,7 +2070,7 @@ namespace Tbot.Workers {
 						continue;
 					}
 
-					if (IsManualReviewDefenseReport(report.ID)) {
+					if (await IsManualReviewDefenseReport(report.ID)) {
 						_tbotInstance.log(LogLevel.Debug, LogSender.AutoFarm,
 							$"Skipping preserved espionage report {report.ID}: planetary defenses are reserved for manual review.");
 						continue;

@@ -184,6 +184,26 @@ namespace TBot.Ogame.Infrastructure.Models {
 				pathfinder: Pathfinder.GetValueOrDefault()).GetFleetPoints();
 		}
 
+		// AutoFarm ratios and limits use resource value, whereas the shared
+		// fleet/defence point helpers use OGame score (one point per 1,000 resources).
+		public long GetDefenseResourceValue(bool includeMissiles = true) {
+			return checked(
+				RocketLauncher.GetValueOrDefault() * 2000 +
+				LightLaser.GetValueOrDefault() * 2000 +
+				HeavyLaser.GetValueOrDefault() * 8000 +
+				GaussCannon.GetValueOrDefault() * 37000 +
+				IonCannon.GetValueOrDefault() * 8000 +
+				PlasmaTurret.GetValueOrDefault() * 130000 +
+				SmallShieldDome.GetValueOrDefault() * 20000 +
+				LargeShieldDome.GetValueOrDefault() * 100000 +
+				(includeMissiles ? AntiBallisticMissiles.GetValueOrDefault() * 10000 +
+					InterplanetaryMissiles.GetValueOrDefault() * 25000 : 0));
+		}
+
+		public long GetFleetResourceValue() {
+			return checked(GetFleetPoints() * 1000);
+		}
+
 		private static bool HasShipOrDefence(params long?[] amounts) {
 			return amounts.Any(amount => amount.GetValueOrDefault() > 0);
 		}

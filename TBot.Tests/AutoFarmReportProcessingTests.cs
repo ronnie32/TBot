@@ -170,8 +170,13 @@ namespace TBot.Tests {
 			}
 		}
 
-		[Fact]
-		public async Task AutoFarmKeepsDefenceReportsAndProcessesFollowingReportsOnlyOnce() {
+		[Theory]
+		[InlineData(100000, 100000, "", false)]
+		[InlineData(200000, 100000, "", false)]
+		[InlineData(200002, 100000, "", true)]
+		[InlineData(1000000, 100000, "Crystal", false)]
+		public async Task AutoFarmKeepsOnlyProfitableDefenceReportsAndProcessesFollowingReportsOnlyOnce(
+			long defenseMetal, long minimumResources, string preferredResource, bool preserveDefense) {
 			var alias = $"report-processing-defense-retention-{Guid.NewGuid():N}";
 			var dataFolder = Path.Combine(AppContext.BaseDirectory, "data");
 			var databasePath = Path.Combine(dataFolder, $"autofarm_{alias}.db");
@@ -182,7 +187,7 @@ namespace TBot.Tests {
 				Coordinate = defenseCoordinate,
 				Date = DateTime.UtcNow,
 				IsInactive = true,
-				Metal = 1000000,
+				Metal = defenseMetal,
 				HasFleetInformation = true,
 				HasDefensesInformation = true,
 				RocketLauncher = 1
@@ -193,6 +198,7 @@ namespace TBot.Tests {
 				Date = DateTime.UtcNow,
 				IsInactive = true,
 				Metal = 1000000,
+				Crystal = 1000000,
 				HasFleetInformation = true,
 				HasDefensesInformation = true
 			};
@@ -223,6 +229,8 @@ namespace TBot.Tests {
 			var settings = SettingsService.GetMergedSettingsFromContents(
 				"{\"AutoFarm\":{\"Active\":true,\"KeepReportsWithDefense\":true,\"ProcessAllReports\":false,\"KeepReportFor\":0,\"MinimumResources\":0,\"PreferedResource\":\"\",\"CargoType\":\"LargeCargo\",\"Blacklist\":{\"Active\":false}}}",
 				new List<string> { "{}" });
+			settings.AutoFarm.MinimumResources = minimumResources;
+			settings.AutoFarm.PreferedResource = preferredResource;
 			var parent = CreateParent(alias, settings, userData);
 			var ogame = Proxy<IOgameService>.Create((method, args) => {
 				if (method.Name == nameof(IOgameService.GetEspionageReportsPage)) {
@@ -262,12 +270,13 @@ namespace TBot.Tests {
 				Assert.True(await secondPass);
 
 				Assert.Equal(new[] { defenseReport.ID, defencelessReport.ID }, readReports);
-				Assert.DoesNotContain(defenseReport.ID, deletedReports);
+				Assert.Equal(!preserveDefense, deletedReports.Contains(defenseReport.ID));
 				Assert.Contains(defencelessReport.ID, deletedReports);
 				Assert.Equal(FarmState.NotSuitable, userData.farmTargets.Single(target => target.HasCoords(defenseCoordinate)).State);
 				Assert.Equal(FarmState.AttackPending, userData.farmTargets.Single(target => target.HasCoords(defencelessCoordinate)).State);
 				using var store = new AutoFarmStateStore($"autofarm_{alias}.db", dataFolder);
-				Assert.Equal(AutoFarmReportPolicy.ManualReviewDefenseOutcome, store.GetProcessedReportOutcome(defenseReport.ID));
+				Assert.Equal(preserveDefense ? AutoFarmReportPolicy.ManualReviewDefenseOutcome : FarmState.NotSuitable.ToString(),
+					store.GetProcessedReportOutcome(defenseReport.ID));
 			} finally {
 				if (File.Exists(databasePath))
 					File.Delete(databasePath);
@@ -941,8 +950,12 @@ namespace TBot.Tests {
 			}
 		}
 
-		[Fact]
-		public async Task AutoFarmDispatchesPendingAttacksAfterACompletedScanWithoutWaitingForTheNextScan() {
+		[Theory]
+		[InlineData(false, false)]
+		[InlineData(true, false)]
+		[InlineData(true, true)]
+		public async Task AutoFarmResumesPendingAttacksAfterSlotExhaustionAndRestart(
+			bool fullScanCompleted, bool stopAfterFullScan) {
 			var alias = $"attack-after-scan-{Guid.NewGuid():N}";
 			var dataFolder = Path.Combine(AppContext.BaseDirectory, "data");
 			var databasePath = Path.Combine(dataFolder, $"autofarm_{alias}.db");
@@ -983,7 +996,9 @@ namespace TBot.Tests {
 			var userData = CreateUserData();
 			userData.celestials = new List<Celestial> { origin, closerOrigin };
 			userData.farmTargets.Add(target);
-			userData.autoFarmReportPhasePending = true;
+			userData.autoFarmReportPhasePending = fullScanCompleted;
+			using (var store = new AutoFarmStateStore($"autofarm_{alias}.db", dataFolder))
+				store.SaveScanCursor(0, 1, 2, DateTime.UtcNow, fullScanCompleted);
 			userData.slots = new Slots { Total = 10, InUse = 0 };
 			userData.serverData = new ServerData { Galaxies = 6, Systems = 499, ProbeCargo = 0 };
 			userData.researches = new Researches { HyperspaceTechnology = 10 };
@@ -1019,11 +1034,19 @@ namespace TBot.Tests {
 }
 """,
 				new List<string> { "{}" });
+			settings.AutoFarm.StopAfterFullScan = stopAfterFullScan;
+			settings.AutoFarm.ScanRange = new dynamic[] {
+				SettingsService.GetMergedSettingsFromContents(
+					"""{"Galaxy":1,"StartSystem":2,"EndSystem":2}""", new List<string> { "{}" })
+			};
 			var sentTargets = new List<Coordinate>();
 			var sentOrigins = new List<Coordinate>();
 			var fleets = new List<Fleet>();
+			var dispatchAttempts = 0;
+			var galaxyReads = 0;
 			var parent = CreateParent(alias, settings, userData);
 			var ogame = Proxy<IOgameService>.Create((method, _) => method.Name switch {
+				nameof(IOgameService.GetGalaxyInfo) => throw new InvalidOperationException($"Unexpected scan {++galaxyReads}"),
 				nameof(IOgameService.GetEspionageReportsPage) => Task.FromResult(new List<EspionageReportSummary>()),
 				_ => Proxy<IOgameService>.Default(method.ReturnType)
 			});
@@ -1048,6 +1071,8 @@ namespace TBot.Tests {
 				if (method.Name == "get_LastFleetSnapshotWasFresh")
 					return true;
 				if (method.Name == nameof(IFleetScheduler.SendValidatedFleet)) {
+					if (++dispatchAttempts == 1)
+						return Task.FromResult((int)SendFleetCode.NotEnoughSlots);
 					sentOrigins.Add(((Celestial)args[0]).Coordinate);
 					var destination = (Coordinate)args[2];
 					sentTargets.Add(destination);
@@ -1091,7 +1116,20 @@ namespace TBot.Tests {
 
 				await (Task)execute.Invoke(worker, null);
 
-				Assert.Equal(new[] { targetCoordinate }, sentTargets);
+				Assert.Empty(sentTargets);
+				Assert.Equal(FarmState.AttackPending, Assert.Single(userData.farmTargets).State);
+				Assert.Equal(fullScanCompleted, userData.autoFarmReportPhasePending);
+				using (var store = new AutoFarmStateStore($"autofarm_{alias}.db", dataFolder)) {
+					Assert.Equal(FarmState.AttackPending, Assert.Single(store.LoadTargets()).State);
+					Assert.Equal(fullScanCompleted, store.LoadScanCursor()?.ReportPhasePending ?? false);
+				}
+				userData.farmTargets.Clear();
+				worker = new AutoFarmWorker(parent, ogame, scheduler, calculation, bridge);
+				await (Task)execute.Invoke(worker, null);
+
+				Assert.Equal(0, galaxyReads);
+				Assert.False(userData.autoFarmReportPhasePending);
+				Assert.True(Assert.Single(sentTargets).IsSame(targetCoordinate));
 				Assert.Equal(new[] { origin.Coordinate }, sentOrigins);
 				Assert.Equal(1, fleets.Single(fleet => fleet.Mission == Missions.Attack).Ships.GetAmount(Buildables.LargeCargo));
 				Assert.Equal(FarmState.AttackSent, Assert.Single(userData.farmTargets).State);
@@ -1239,6 +1277,54 @@ namespace TBot.Tests {
 				Assert.Equal(new[] { origin.Coordinate }, sentOrigins);
 				Assert.Equal(1, fleets.Single(fleet => fleet.Mission == Missions.Attack).Ships.GetAmount(Buildables.SmallCargo));
 				Assert.Equal(FarmState.AttackSent, Assert.Single(userData.farmTargets).State);
+			} finally {
+				if (File.Exists(databasePath))
+					File.Delete(databasePath);
+			}
+		}
+
+		[Theory]
+		[InlineData(100000, false)]
+		[InlineData(400000, true)]
+		public async Task CachedManualReviewWithoutATargetRechecksTheResourceThreshold(long metal, bool preserve) {
+			var alias = $"cached-defense-threshold-{Guid.NewGuid():N}";
+			var databasePath = Path.Combine(AppContext.BaseDirectory, "data", $"autofarm_{alias}.db");
+			var report = new EspionageReport {
+				ID = 994001, Coordinate = new Coordinate(1, 1, 7, Celestials.Planet),
+				Metal = metal, HasFleetInformation = true, HasDefensesInformation = true, RocketLauncher = 1
+			};
+			var settings = SettingsService.GetMergedSettingsFromContents(
+				"""{"AutoFarm":{"KeepReportsWithDefense":true,"MinimumResources":100000,"PreferedResource":""}}""",
+				new List<string> { "{}" });
+			var deleted = new List<int>();
+			var reads = 0;
+			var ogame = Proxy<IOgameService>.Create((method, args) => {
+				if (method.Name == nameof(IOgameService.GetEspionageReport)) {
+					reads++;
+					return Task.FromResult(report);
+				}
+				if (method.Name == nameof(IOgameService.DeleteReport))
+					return DeleteReport(deleted, (int)args[0]);
+				return Proxy<IOgameService>.Default(method.ReturnType);
+			});
+
+			try {
+				using (var store = new AutoFarmStateStore($"autofarm_{alias}.db"))
+					store.RecordProcessedReport(report.ID, report.Coordinate,
+						AutoFarmReportPolicy.ManualReviewDefenseOutcome, DateTime.UtcNow);
+				var worker = new AutoFarmWorker(CreateParent(alias, settings, CreateUserData()),
+					ogame, CreateScheduler(), CreateCalculation(), CreateBridge());
+				var process = typeof(AutoFarmWorker).GetMethod("ProcessEspionageReportSummary",
+					BindingFlags.Instance | BindingFlags.NonPublic);
+				var result = await (Task<(bool Continue, bool CleanupSucceeded)>) process.Invoke(worker,
+					new object[] {
+						new EspionageReportSummary { ID = report.ID, Type = EspionageReportType.Report },
+						false, DateTime.UtcNow
+					});
+
+				Assert.True(result.CleanupSucceeded);
+				Assert.Equal(1, reads);
+				Assert.Equal(!preserve, deleted.Contains(report.ID));
 			} finally {
 				if (File.Exists(databasePath))
 					File.Delete(databasePath);
