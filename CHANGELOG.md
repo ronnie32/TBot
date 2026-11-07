@@ -1,5 +1,35 @@
 # Changelog
 
+## v3.6.0-beta1
+
+> **Beta warning:** Safe and Balanced are experimental and can lose ships. Start in observation-only mode. User feedback is needed: share your profile, settings, prediction and combat result, without private account data.
+
+### Added
+
+#### AutoFarm
+
+- Added optional simulation-based fleet selection with Safe (no sampled losses) and Balanced (limited sampled losses) profiles, ranked by profit or profit per hour.
+- Added observation-only mode to review predictions without sending attacks or probes.
+
+### Changed
+
+#### AutoFarm
+
+- Rechecked reports, bonuses, ships, fuel, cargo capacity and fleet slots before dispatch. Missing or unsupported combat data blocks the attack.
+
+### Fixed
+
+#### AutoFarm
+
+- Read defender combat bonuses from espionage report HTML, preserving all reported decimals.
+- Corrected Bomber, Deathstar and Reaper rapid-fire values.
+- Kept deferred targets pending and prevented automatic fleet-dispatch retries.
+
+Enable `AutoFarm.CombatPlanner.Active`; start with `ObservationOnly: true`. Update TBot and OGameD together. See [configuration](docs/autofarm-combat-planner.md).
+
+Build version: **3.6.0.1**
+Release channel: **Beta**
+
 ## v3.5.1-beta3
 
 > **Beta release:** This release fixes AutoFarm pending attacks, escort sizing, point limits and defense report retention.

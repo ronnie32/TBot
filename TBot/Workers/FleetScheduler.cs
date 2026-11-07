@@ -445,8 +445,8 @@ if (fleet == null) return;
 			return DispatchFleet(origin, ships, destination, mission, speed, payload, playerClass, force, validateShips: false, reduceExpeditionPayload: false);
 		}
 
-		public Task<int> SendValidatedFleet(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload = null, CharacterClass playerClass = CharacterClass.NoClass, bool force = false) {
-			return DispatchFleet(origin, ships, destination, mission, speed, payload, playerClass, force, validateShips: true, reduceExpeditionPayload: false);
+		public Task<int> SendValidatedFleet(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload = null, CharacterClass playerClass = CharacterClass.NoClass, bool force = false, Func<Celestial, bool> beforeDispatch = null) {
+			return DispatchFleet(origin, ships, destination, mission, speed, payload, playerClass, force, validateShips: true, reduceExpeditionPayload: false, beforeDispatch);
 		}
 
 		public Task<int> SendExpedition(Celestial origin, Ships ships, Coordinate destination, decimal speed, Resources payload = null, CharacterClass playerClass = CharacterClass.NoClass) {
@@ -611,16 +611,16 @@ if (fleet == null) return;
 
 		public bool LastFleetSnapshotWasFresh => _lastFleetSnapshotWasFresh;
 
-		private async Task<int> DispatchFleet(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload, CharacterClass playerClass, bool force, bool validateShips, bool reduceExpeditionPayload) {
+		private async Task<int> DispatchFleet(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload, CharacterClass playerClass, bool force, bool validateShips, bool reduceExpeditionPayload, Func<Celestial, bool> beforeDispatch = null) {
 			await _dispatchSemaphore.WaitAsync();
 			try {
-				return await SendFleetCore(origin, ships, destination, mission, speed, payload, playerClass, force, validateShips, reduceExpeditionPayload);
+				return await SendFleetCore(origin, ships, destination, mission, speed, payload, playerClass, force, validateShips, reduceExpeditionPayload, beforeDispatch);
 			} finally {
 				_dispatchSemaphore.Release();
 			}
 		}
 
-		private async Task<int> SendFleetCore(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload, CharacterClass playerClass, bool force, bool validateShips, bool reduceExpeditionPayload) {
+		private async Task<int> SendFleetCore(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload, CharacterClass playerClass, bool force, bool validateShips, bool reduceExpeditionPayload, Func<Celestial, bool> beforeDispatch) {
 			_tbotInstance.log(LogLevel.Information, LogSender.FleetScheduler, $"Sending fleet from {origin.Coordinate.ToString()} to {destination.ToString()}. Mission: {mission.ToString()}. Speed: {(speed * 10).ToString()}% Ships: {ships?.ToString() ?? "none"}");
 
 			if (playerClass == CharacterClass.NoClass)
@@ -793,6 +793,11 @@ if (fleet == null) return;
 							_tbotInstance.log(LogLevel.Information, LogSender.FleetScheduler,
 								$"Reduced expedition deuterium payload from {requestedPayload} to {payload.Deuterium}; flight fuel was reserved first.");
 						}
+					}
+					if (beforeDispatch != null && !beforeDispatch(origin)) {
+						_tbotInstance.log(LogLevel.Warning, LogSender.FleetScheduler,
+							"Fleet dispatch constraints changed after validation; no fleet sent.");
+						return (int) SendFleetCode.GenericError;
 					}
 					Fleet newFleet = await _ogameService.SendFleet(origin, ships, destination, mission, speed, payload);
 					if (newFleet == null) {

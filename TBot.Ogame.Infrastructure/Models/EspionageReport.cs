@@ -16,6 +16,8 @@ namespace TBot.Ogame.Infrastructure.Models {
 		public string Username { get; set; }
 		public CharacterClass CharacterClass { get; set; }
 		public AllianceClass AllianceClass { get; set; }
+		public bool HasClassInformation { get; set; }
+		public ReportCombatBonuses CombatBonuses { get; set; }
 		public int LastActivity { get; set; }
 		public int CounterEspionage { get; set; }
 		public string APIKey { get; set; }

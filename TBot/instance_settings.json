@@ -470,6 +470,16 @@
 		"ReapersPer100kFleet": 2,
 		"MaxDefensePoints": 0,
 		"MaxFleetPoints": 0,
+		"CombatPlanner": {
+			"Active": false,
+			"ObservationOnly": false,
+			"MaxFailureProbabilityPercent": 1,
+			"MaxAbsoluteLoss": 100000,
+			"Profile": "Safe",
+			"Objective": "ProfitPerHour",
+			"MinimumNetProfit": 100000,
+			"MaxReportAgeSeconds": 300
+		},
 		"NumProbes": 52,
 		"Origin": [
 			{

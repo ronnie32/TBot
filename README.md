@@ -36,6 +36,8 @@ Do you like the project? Buy me a beer!
 
 ## Configuration
 
+AutoFarm combat planning: [setup, experimental profiles and model limits](docs/autofarm-combat-planner.md).
+
 TBot configuration consists in two files:
 - *settings.json* handles the configuration of Telegram Bot, WebUI and of the bot instances.
   *settings.json* can be passed as a command line argument as follows:

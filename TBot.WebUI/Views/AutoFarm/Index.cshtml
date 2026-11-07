@@ -15,58 +15,119 @@
     <link rel="stylesheet" href="~/css/autofarm.css" asp-append-version="true" />
 }
 
-<div class="autofarm-page" id="autofarm-dashboard" data-instance="@Model.SelectedInstance">
-    <div class="autofarm-shell">
-        <header class="autofarm-header">
-            <div>
-                <h1>AutoFarm</h1>
-                <p class="intro">Read-only diagnostic information about scans, decisions and fleets sent by AutoFarm.</p>
-            </div>
-            <form method="get" class="instance-picker">
+<div class="af" id="autofarm-dashboard" data-instance="@Model.SelectedInstance">
+    <header class="af-head">
+        <h1>AutoFarm</h1>
+        @if (Model.Instances.Count > 1)
+        {
+            <form method="get" class="af-instance" id="af-instance-form">
                 <label for="instance">Instance</label>
-                <div class="instance-controls">
-                    <select id="instance" name="instance">
-                        @foreach (var instance in Model.Instances)
+                <select id="instance" name="instance">
+                    @foreach (var instance in Model.Instances)
+                    {
+                        if (string.Equals(instance, Model.SelectedInstance, StringComparison.OrdinalIgnoreCase))
                         {
-                            if (string.Equals(instance, Model.SelectedInstance, StringComparison.OrdinalIgnoreCase))
-                            {
-                                <option value="@instance" selected>@instance</option>
-                            }
-                            else
-                            {
-                                <option value="@instance">@instance</option>
-                            }
+                            <option value="@instance" selected>@instance</option>
                         }
-                    </select>
-                    <button type="submit" class="refresh-button">Open</button>
-                </div>
+                        else
+                        {
+                            <option value="@instance">@instance</option>
+                        }
+                    }
+                </select>
+                <noscript><button type="submit">Open</button></noscript>
             </form>
-        </header>
+        }
+        else
+        {
+            <p class="af-instance">Instance <strong>@Model.SelectedInstance</strong></p>
+        }
+    </header>
 
-        <div class="dashboard-toolbar" role="status" aria-live="polite">
-            <span id="poll-status">Loading current data...</span>
-            <span id="last-updated"></span>
-            <button type="button" class="plain-button" id="copy-logs">Copy logs</button>
-        </div>
+    <section class="af-status" id="af-status" aria-label="Worker status"></section>
+    <div id="af-notice"></div>
+    <section class="af-summary" id="af-summary" aria-label="Summary"></section>
 
-        <div id="dashboard-notice"></div>
-        <div id="dashboard-content"></div>
+    <div class="af-tabs" role="tablist" aria-label="AutoFarm data">
+        <button type="button" role="tab" id="af-tab-targets" data-tab="targets" aria-controls="af-panel">Targets <span class="af-tab-count"></span></button>
+        <button type="button" role="tab" id="af-tab-attacks" data-tab="attacks" aria-controls="af-panel">Attacks <span class="af-tab-count"></span></button>
+        <button type="button" role="tab" id="af-tab-systems" data-tab="systems" aria-controls="af-panel">Systems <span class="af-tab-count"></span></button>
+        <button type="button" role="tab" id="af-tab-logs" data-tab="logs" aria-controls="af-panel">Logs <span class="af-tab-count"></span></button>
     </div>
+
+    <section id="af-panel" class="af-panel" role="tabpanel">
+        <div class="af-tools">
+            <div class="af-filters" id="af-filters"></div>
+            <div class="af-tools-end">
+                <button type="button" class="af-button" id="af-copy" data-key="copy" hidden>Copy</button>
+                <input type="search" class="af-search" id="af-search" autocomplete="off" aria-label="Search" />
+            </div>
+        </div>
+        <div id="af-results"></div>
+    </section>
+
+    <p class="af-live" id="af-live" role="status" aria-live="polite">Loading current data...</p>
 </div>
 
 <script>
     (() => {
-        const root = document.getElementById("autofarm-dashboard");
-        const content = document.getElementById("dashboard-content");
-        const notice = document.getElementById("dashboard-notice");
-        const pollStatus = document.getElementById("poll-status");
-        const lastUpdated = document.getElementById("last-updated");
-        const copyLogsButton = document.getElementById("copy-logs");
+        const $ = id => document.getElementById(id);
+        const root = $("autofarm-dashboard");
+        const statusEl = $("af-status");
+        const noticeEl = $("af-notice");
+        const summaryEl = $("af-summary");
+        const filtersEl = $("af-filters");
+        const resultsEl = $("af-results");
+        const panelEl = $("af-panel");
+        const searchEl = $("af-search");
+        const copyEl = $("af-copy");
+        const liveEl = $("af-live");
         const instance = root.dataset.instance;
         const snapshotUrl = '@Url.Action("Snapshot", "AutoFarm")';
+        const PAGE_SIZE = 100;
+        const POLL_MS = 5000;
+
         let snapshot = @Html.Raw(initialSnapshot);
-        let renderedSnapshotKey = "";
+        let dataKey = "";
+        let lastSync = null;
         let requestInProgress = false;
+
+        // Worker states as produced by AutoFarmDashboardReader.BuildWorkerStatus.
+        const WORKER_STATES = {
+            Active: { title: "Running", tone: "done" },
+            Stale: { title: "No recent activity", tone: "ready" },
+            Error: { title: "Last log line is a problem", tone: "bad" },
+            Disabled: { title: "Disabled in settings", tone: "off" },
+            Unknown: { title: "No activity in today's logs", tone: "off" }
+        };
+
+        // Listed in pipeline order: this is also the order of the filters.
+        const TARGET_STATES = {
+            ProbesPending: { label: "Probes pending", tone: "transit" },
+            ProbesSent: { label: "Probes sent", tone: "transit" },
+            ProbesRequired: { label: "More probes required", tone: "retry" },
+            FailedProbesRequired: { label: "Probes insufficient", tone: "retry" },
+            AttackPending: { label: "Attack pending", tone: "ready" },
+            AttackSent: { label: "Attack sent", tone: "done" },
+            NotSuitable: { label: "Not suitable", tone: "off" },
+            Idle: { label: "Idle", tone: "off" }
+        };
+
+        const SYSTEM_STATES = {
+            "Cached": { label: "Usable", tone: "done" },
+            "Cached no targets": { label: "No targets", tone: "off" },
+            "Cached empty": { label: "Empty", tone: "faint" }
+        };
+
+        const LOG_TONES = { Error: "bad", Warning: "ready", Information: "transit" };
+
+        const tabs = {
+            targets: { filter: "all", query: "", limit: PAGE_SIZE, sort: { key: "updatedAtUtc", dir: -1 }, placeholder: "Search name, coordinate or reason" },
+            attacks: { filter: "all", query: "", limit: PAGE_SIZE, sort: { key: "dispatchedAtUtc", dir: -1 }, placeholder: "Search target, origin or report" },
+            systems: { filter: "all", query: "", limit: PAGE_SIZE, sort: { key: "lastScannedUtc", dir: -1 }, placeholder: "Search system, like 3:142" },
+            logs: { filter: "all", query: "", limit: PAGE_SIZE, sort: null, placeholder: "Search logs" }
+        };
+        let activeTab = tabs[location.hash.slice(1)] ? location.hash.slice(1) : "targets";
 
         function escapeHtml(value) {
             return String(value ?? "")
@@ -77,202 +138,537 @@
                 .replaceAll("'", "&#039;");
         }
 
+        function parseTime(value) {
+            if (!value) return null;
+            const time = Date.parse(value);
+            // DateTime.MinValue marks an attack whose date could not be parsed.
+            return Number.isNaN(time) || time <= 0 ? null : time;
+        }
+
+        const formatNumber = value => Number(value || 0).toLocaleString();
+        const plural = (count, noun) => `${formatNumber(count)} ${noun}${count === 1 ? "" : "s"}`;
+        const compactFormat = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+        const formatCompact = value => compactFormat.format(Number(value || 0));
+
         function formatDate(value) {
-            if (!value) return "Not available";
-            const date = new Date(value);
-            return Number.isNaN(date.getTime()) ? "Not available" : date.toLocaleString();
+            const time = parseTime(value);
+            return time === null ? "Not available" : new Date(time).toLocaleString();
         }
 
-        function formatNumber(value) {
-            return Number(value || 0).toLocaleString();
+        function formatClock(value) {
+            const time = parseTime(value);
+            return time === null ? "" : new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
         }
 
-        function statusClass(value) {
-            return String(value || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        function formatRelative(value, dueLabel) {
+            const time = parseTime(value);
+            if (time === null) return "Not available";
+            const delta = Date.now() - time;
+            const future = delta < 0;
+            if (dueLabel && !future) return dueLabel;
+            const seconds = Math.abs(delta) / 1000;
+            if (seconds < 45) return future ? "in under a minute" : "just now";
+            const amount = seconds < 3600 ? `${Math.max(1, Math.round(seconds / 60))} min`
+                : seconds < 86400 ? `${Math.round(seconds / 3600)} h`
+                : `${Math.round(seconds / 86400)} d`;
+            return future ? `in ${amount}` : `${amount} ago`;
         }
 
-        function emptyRow(columns, message) {
-            return `<tr><td colspan="${columns}" class="empty-cell">${escapeHtml(message)}</td></tr>`;
+        // Relative times are refreshed by tick() without rebuilding the table around them.
+        function timeHtml(value, dueLabel) {
+            if (parseTime(value) === null) return `<span class="af-dim">Not available</span>`;
+            const due = dueLabel ? ` data-due="${escapeHtml(dueLabel)}"` : "";
+            return `<time datetime="${escapeHtml(value)}" title="${escapeHtml(formatDate(value))}" data-rel="${escapeHtml(value)}"${due}>${escapeHtml(formatRelative(value, dueLabel))}</time>`;
         }
 
-        function reasonHtml(label, detail) {
-            return `<div class="reason"><span class="reason-label reason-${statusClass(label)}">${escapeHtml(label || "No reason recorded")}</span><span class="reason-detail">${escapeHtml(detail || "")}</span></div>`;
-        }
-
-        function renderWorker(worker, databaseAvailable) {
-            return `<section class="panel">
-                <div class="panel-heading"><h2>Worker status</h2><span class="status status-${statusClass(worker.state)}">${escapeHtml(worker.state)}</span></div>
-                <dl class="facts-grid">
-                    <div><dt>Last execution</dt><dd>${formatDate(worker.lastExecutionUtc)}</dd></div>
-                    <div><dt>Last activity</dt><dd>${formatDate(worker.lastActivityUtc)}</dd></div>
-                    <div><dt>Next execution</dt><dd>${escapeHtml(worker.nextExecutionText || "Not available")}</dd></div>
-                    <div><dt>Database</dt><dd>${databaseAvailable ? "Available" : "Not available"}</dd></div>
-                </dl>
-            </section>`;
-        }
-
-        function renderSlots(slots) {
-            const max = slots.maxSlots == null ? "Not available" : formatNumber(slots.maxSlots);
-            const used = slots.usedSlots == null ? "Not available" : formatNumber(slots.usedSlots);
-            const available = slots.availableSlots == null ? "Not available" : formatNumber(slots.availableSlots);
-            return `<section class="panel">
-                <div class="panel-heading"><h2>Fleet slots</h2><span class="panel-count">AutoFarm budget</span></div>
-                <div class="metric-grid">
-                    <div class="metric"><span>Used</span><strong>${used}</strong></div>
-                    <div class="metric"><span>Available</span><strong>${available}</strong></div>
-                    <div class="metric"><span>Maximum</span><strong>${max}</strong></div>
-                    <div class="metric"><span>Probes observed</span><strong>${formatNumber(slots.probesInFlight)}</strong></div>
-                    <div class="metric"><span>Attacks observed</span><strong>${formatNumber(slots.attacksInFlight)}</strong></div>
-                </div>
-                <p class="panel-note">Slot values come from the latest AutoFarm budget message. Probe and attack counts are observed in the current cycle.</p>
-            </section>`;
-        }
-
-        function renderScan(scan) {
-            const percent = Math.max(0, Math.min(100, Number(scan.progressPercent || 0)));
-            const cursor = scan.cursorGalaxy > 0 ? `${scan.cursorGalaxy}:${scan.cursorSystem}` : "Not available";
-            return `<section class="panel">
-                <div class="panel-heading"><h2>Scan progress</h2><span class="panel-count">${formatNumber(percent)}%</span></div>
-                <div class="progress-line"><progress max="100" value="${percent}"></progress><strong>${formatNumber(scan.scannedSystemsInRange)} / ${formatNumber(scan.totalSystemsInRange)} systems</strong></div>
-                <dl class="facts-grid compact-facts">
-                    <div><dt>Current cursor</dt><dd>${escapeHtml(cursor)}</dd></div>
-                    <div><dt>Cached systems</dt><dd>${formatNumber(scan.cachedSystems)}</dd></div>
-                    <div><dt>Cursor updated</dt><dd>${formatDate(scan.cursorUpdatedAtUtc)}</dd></div>
-                    <div><dt>Last system observed</dt><dd>${formatDate(scan.lastSystemObservedAtUtc)}</dd></div>
-                </dl>
-            </section>`;
-        }
-
-        function renderReports(reports) {
-            const rows = reports.length ? reports.map(report => `<tr>
-                <td><strong>${escapeHtml(report.targetName || "Unnamed target")}</strong><span class="coordinate">${escapeHtml(report.coordinate)}</span></td>
-                <td><span class="status status-${statusClass(report.state)}">${escapeHtml(report.state)}</span><span class="coordinate">Report #${formatNumber(report.reportId)}</span></td>
-                <td class="resources">${formatNumber(report.totalResources)}</td>
-                <td>${reasonHtml(report.reason, report.reasonDetail)}</td>
-                <td class="muted">${formatDate(report.updatedAtUtc)}</td>
-            </tr>`).join("") : emptyRow(5, "No reports are currently stored.");
-            return `<section class="panel panel-primary">
-                <div class="panel-heading"><h2>Targets and decisions</h2><span class="panel-count">${formatNumber(reports.length)}</span></div>
-                <p class="panel-note">The reason column explains why AutoFarm sent, postponed or ignored each target.</p>
-                <div class="table-wrap"><table><thead><tr><th>Target</th><th>State</th><th>Reported resources</th><th>Reason</th><th>Updated</th></tr></thead><tbody>${rows}</tbody></table></div>
-            </section>`;
-        }
-
-        function renderSystems(systems) {
-            const rows = systems.length ? systems.map(system => `<tr>
-                <td class="mono">${escapeHtml(system.coordinate)}</td>
-                <td><span class="status status-${statusClass(system.status)}">${escapeHtml(system.status)}</span></td>
-                <td>${formatDate(system.lastScannedUtc)}</td>
-                <td>${formatDate(system.nextRefreshUtc)}</td>
-                <td>${escapeHtml(system.reason)}</td>
-            </tr>`).join("") : emptyRow(5, "No cached systems are stored.");
-            return `<section class="panel">
-                <div class="panel-heading"><h2>Cached systems</h2><span class="panel-count">${formatNumber(systems.length)}</span></div>
-                <div class="table-wrap"><table><thead><tr><th>System</th><th>Status</th><th>Last scan</th><th>Next refresh</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table></div>
-            </section>`;
-        }
-
-        function renderAttacks(attacks) {
-            const rows = attacks.length ? attacks.map(attack => `<tr>
-                <td>${formatDate(attack.dispatchedAtUtc)}</td>
-                <td><strong>${escapeHtml(attack.origin)}</strong><span class="coordinate">${escapeHtml(attack.mission)}</span></td>
-                <td><strong>${escapeHtml(attack.targetName || "Unnamed target")}</strong><span class="coordinate">${escapeHtml(attack.coordinate)}</span></td>
-                <td class="mono">#${formatNumber(attack.reportId)}</td>
-                <td class="resources">${formatNumber(attack.totalResources)}</td>
-            </tr>`).join("") : emptyRow(5, "No fleet dispatch has been recorded yet.");
-            return `<section class="panel">
-                <div class="panel-heading"><h2>Recorded attacks</h2><span class="panel-count">${formatNumber(attacks.length)}</span></div>
-                <p class="panel-note">Only dispatches successfully recorded after a fleet was sent are shown here.</p>
-                <div class="table-wrap"><table><thead><tr><th>When</th><th>Origin</th><th>Destination</th><th>Report</th><th>Reported resources</th></tr></thead><tbody>${rows}</tbody></table></div>
-            </section>`;
-        }
-
-        function renderErrors(errors) {
-            const rows = errors.length ? errors.map(log => `<tr><td>${formatDate(log.dateTimeUtc)}</td><td>${escapeHtml(log.sender)}</td><td class="log-message">${escapeHtml(log.message)}</td></tr>`).join("") : emptyRow(3, "No recent AutoFarm errors or warnings.");
-            return `<section class="panel">
-                <div class="panel-heading"><h2>Recent errors</h2><button type="button" class="plain-button copy-errors" id="copy-errors">Copy errors</button></div>
-                <div class="table-wrap"><table><thead><tr><th>When</th><th>Source</th><th>Message</th></tr></thead><tbody>${rows}</tbody></table></div>
-            </section>`;
-        }
-
-        function renderLogs(logs) {
-            const text = logs.map(log => log.copyText).join("\n");
-            return `<section class="panel">
-                <details class="logs-details" id="autofarm-log-details">
-                    <summary id="autofarm-log-summary">Recent AutoFarm logs (${formatNumber(logs.length)})</summary>
-                    <pre>${escapeHtml(text || "No logs available.")}</pre>
-                </details>
-            </section>`;
-        }
-
-        function captureUiState() {
-            const activeElement = document.activeElement;
-            return {
-                activeId: activeElement && activeElement.id ? activeElement.id : null,
-                details: Array.from(content.querySelectorAll("details[id]")).map(details => ({ id: details.id, open: details.open })),
-                scrollTop: window.scrollY
-            };
-        }
-
-        function restoreUiState(state) {
-            state.details.forEach(item => {
-                const details = document.getElementById(item.id);
-                if (details) details.open = item.open;
+        function tick() {
+            root.querySelectorAll("[data-rel]").forEach(element => {
+                element.textContent = formatRelative(element.dataset.rel, element.dataset.due);
             });
+        }
 
-            if (state.activeId) {
-                const activeElement = document.getElementById(state.activeId);
-                if (activeElement) activeElement.focus({ preventScroll: true });
+        const toneDot = tone => `<span class="af-dot af-tone-${tone}" aria-hidden="true"></span>`;
+        const stateBadge = meta => `<span class="af-state">${toneDot(meta.tone)}${escapeHtml(meta.label)}</span>`;
+        const targetState = state => TARGET_STATES[state] || { label: state || "Unknown", tone: "off" };
+        const systemState = status => SYSTEM_STATES[status] || { label: status || "Unknown", tone: "off" };
+
+        const isBlocked = report => /^(blocked|attack dispatch failed|no suitable origin|manual review)/i.test(report.reason || "");
+
+        function resourcesHtml(row) {
+            const parts = [["M", row.metal], ["C", row.crystal], ["D", row.deuterium]]
+                .map(([letter, value]) => `<span title="${formatNumber(value)}"><abbr>${letter}</abbr> ${formatCompact(value)}</span>`)
+                .join("");
+            return `<strong title="${formatNumber(row.totalResources)}">${formatCompact(row.totalResources)}</strong><span class="af-split">${parts}</span>`;
+        }
+
+        function targetCellHtml(name, coordinate) {
+            return `<strong class="af-name">${escapeHtml(name || "Unnamed target")}</strong><span class="af-coord">${escapeHtml(coordinate)}</span>`;
+        }
+
+        function reasonHtml(report) {
+            const stateLabel = targetState(report.state).label;
+            const label = report.reason || "";
+            // The reader falls back to the raw state name when it has no better reason.
+            const repeatsState = label === report.state || label.toLowerCase() === stateLabel.toLowerCase();
+            const detail = report.reasonDetail || "";
+            const labelHtml = label && !repeatsState ? `<span class="af-reason${isBlocked(report) ? " af-reason-blocked" : ""}">${escapeHtml(label)}</span>` : "";
+            const detailHtml = detail ? `<span class="af-sub">${escapeHtml(detail)}</span>` : "";
+            return labelHtml + detailHtml || `<span class="af-dim">No reason recorded</span>`;
+        }
+
+        function renderStatus(data) {
+            const worker = data.worker;
+            const meta = WORKER_STATES[worker.state] || WORKER_STATES.Unknown;
+            const facts = [];
+            if (parseTime(worker.lastExecutionUtc) !== null) facts.push(`Last check ${formatRelative(worker.lastExecutionUtc)}.`);
+            if (parseTime(worker.lastActivityUtc) !== null) facts.push(`Last activity ${formatRelative(worker.lastActivityUtc)}.`);
+            const next = parseTime(worker.nextExecutionUtc);
+            if (next !== null) {
+                facts.push(next > Date.now()
+                    ? `Next check ${formatRelative(worker.nextExecutionUtc)}, at ${formatClock(worker.nextExecutionUtc)}.`
+                    : `Next check was due ${formatRelative(worker.nextExecutionUtc)}.`);
             }
 
-            window.scrollTo(0, state.scrollTop);
+            const errors = data.errors;
+            const problem = errors.length ? `<button type="button" class="af-problem${worker.state === "Error" ? " af-problem-bad" : ""}" data-go="logs:problems" data-key="problem">
+                <span class="af-problem-count">${errors.length >= 40 ? "40+ problems" : plural(errors.length, "problem")} today</span>
+                <span class="af-problem-text">${escapeHtml(errors[0].message)}</span>
+                <span class="af-problem-action">Review</span>
+            </button>` : "";
+
+            statusEl.innerHTML = `<div class="af-status-line af-tone-${meta.tone}">
+                    <span class="af-pulse" aria-hidden="true"></span>
+                    <h2>${escapeHtml(meta.title)}</h2>
+                </div>
+                <p class="af-status-facts">${escapeHtml(facts.join(" ") || "Nothing recorded yet.")}</p>
+                ${problem}`;
         }
 
-        function render(data) {
-            snapshot = data;
-            const nextSnapshotKey = JSON.stringify(data);
-            notice.innerHTML = data.databaseAvailable ? "" : `<div class="notice">No AutoFarm database is available for this instance yet. The page will populate after AutoFarm has run once.</div>`;
+        function renderNotice(data) {
+            noticeEl.innerHTML = data.databaseAvailable ? "" : `<p class="af-notice">No AutoFarm database for this instance yet. This page fills in after AutoFarm has run once.</p>`;
+        }
 
-            if (nextSnapshotKey === renderedSnapshotKey) return;
+        function slotsCell(slots) {
+            const hasBudget = slots.maxSlots != null && slots.usedSlots != null;
+            const seen = `${plural(slots.probesInFlight, "probe")} and ${plural(slots.attacksInFlight, "attack")} seen this cycle.`;
+            if (!hasBudget) {
+                const limit = slots.maxSlots != null ? `Limit ${formatNumber(slots.maxSlots)}. ` : "";
+                return `<div class="af-cell"><span class="af-cell-label">Fleet slots</span><span class="af-cell-value"><small>Not reported yet</small></span><span class="af-cell-note">${limit}${seen}</span></div>`;
+            }
 
-            const uiState = captureUiState();
-            content.innerHTML = [
-                renderWorker(data.worker, data.databaseAvailable),
-                renderSlots(data.slots),
-                renderScan(data.scan),
-                renderReports(data.reports),
-                renderSystems(data.systems),
-                renderAttacks(data.attacks),
-                renderErrors(data.errors),
-                renderLogs(data.logs)
-            ].join("");
-            renderedSnapshotKey = nextSnapshotKey;
-            restoreUiState(uiState);
+            const used = Math.min(slots.usedSlots, slots.maxSlots);
+            const meter = slots.maxSlots <= 32
+                ? `<span class="af-pips" aria-hidden="true">${Array.from({ length: slots.maxSlots }, (_, index) => `<i${index < used ? ' class="af-pip-on"' : ""}></i>`).join("")}</span>`
+                : `<span class="af-bar" aria-hidden="true"><i style="width:${Math.round(used * 100 / slots.maxSlots)}%"></i></span>`;
+            const free = slots.availableSlots == null ? "" : `${formatNumber(slots.availableSlots)} free. `;
+            return `<div class="af-cell" title="Slot values come from the latest AutoFarm budget message.">
+                <span class="af-cell-label">Fleet slots</span>
+                <span class="af-cell-value">${formatNumber(slots.usedSlots)} <small>of ${formatNumber(slots.maxSlots)} used</small></span>
+                ${meter}
+                <span class="af-cell-note">${free}${seen}</span>
+            </div>`;
+        }
+
+        function targetsCell(reports) {
+            const pending = reports.filter(report => report.state === "AttackPending").length;
+            const blocked = reports.filter(isBlocked).length;
+            const note = blocked
+                ? `<span class="af-cell-note af-cell-note-bad">${formatNumber(blocked)} blocked</span>`
+                : `<span class="af-cell-note">${formatNumber(reports.length)} targets with a report</span>`;
+            return `<button type="button" class="af-cell" data-go="targets:${blocked ? "blocked" : "AttackPending"}" data-key="cell-targets">
+                <span class="af-cell-label">Targets</span>
+                <span class="af-cell-value">${formatNumber(pending)} <small>attack pending</small></span>
+                ${note}
+            </button>`;
+        }
+
+        function scanCell(scan) {
+            const percent = Math.max(0, Math.min(100, Number(scan.progressPercent || 0)));
+            const cursor = scan.cursorGalaxy > 0 ? ` Cursor at ${scan.cursorGalaxy}:${scan.cursorSystem}.` : "";
+            const value = scan.totalSystemsInRange > 0
+                ? `${percent}% <small>of scan range</small>`
+                : `<small>No scan range configured</small>`;
+            return `<button type="button" class="af-cell" data-go="systems:all" data-key="cell-scan">
+                <span class="af-cell-label">Scan</span>
+                <span class="af-cell-value">${value}</span>
+                <span class="af-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-label="Scan progress"><i style="width:${percent}%"></i></span>
+                <span class="af-cell-note">${formatNumber(scan.scannedSystemsInRange)} of ${formatNumber(scan.totalSystemsInRange)} systems.${cursor}</span>
+            </button>`;
+        }
+
+        function attacksCell(attacks) {
+            const total = attacks.reduce((sum, attack) => sum + Number(attack.totalResources || 0), 0);
+            const note = attacks.length
+                ? `${formatCompact(total)} reported. Latest ${timeHtml(attacks[0].dispatchedAtUtc)}.`
+                : "No fleet sent yet.";
+            return `<button type="button" class="af-cell" data-go="attacks:all" data-key="cell-attacks">
+                <span class="af-cell-label">Attacks</span>
+                <span class="af-cell-value">${attacks.length >= 100 ? "100+" : formatNumber(attacks.length)} <small>recorded</small></span>
+                <span class="af-cell-note">${note}</span>
+            </button>`;
+        }
+
+        function renderSummary(data) {
+            summaryEl.innerHTML = slotsCell(data.slots) + targetsCell(data.reports) + scanCell(data.scan) + attacksCell(data.attacks);
+        }
+
+        function renderTabs(data) {
+            const counts = {
+                targets: formatNumber(data.reports.length),
+                attacks: formatNumber(data.attacks.length),
+                systems: formatNumber(data.systems.length),
+                logs: formatNumber(data.errors.length || data.logs.length)
+            };
+            root.querySelectorAll("[data-tab]").forEach(tab => {
+                const selected = tab.dataset.tab === activeTab;
+                tab.setAttribute("aria-selected", String(selected));
+                tab.tabIndex = selected ? 0 : -1;
+                const count = tab.querySelector(".af-tab-count");
+                count.textContent = counts[tab.dataset.tab];
+                count.classList.toggle("af-tab-count-bad", tab.dataset.tab === "logs" && data.errors.length > 0);
+            });
+            panelEl.setAttribute("aria-labelledby", `af-tab-${activeTab}`);
+        }
+
+        function filtersFor(tab, data) {
+            const countBy = (rows, test) => rows.filter(test).length;
+            if (tab === "targets") {
+                const stateFilters = Object.keys(TARGET_STATES).map(state => ({
+                    id: state,
+                    label: TARGET_STATES[state].label,
+                    tone: TARGET_STATES[state].tone,
+                    count: countBy(data.reports, report => report.state === state)
+                }));
+                return [
+                    { id: "all", label: "All", count: data.reports.length },
+                    { id: "blocked", label: "Blocked", tone: "bad", count: countBy(data.reports, isBlocked) },
+                    ...stateFilters
+                ];
+            }
+            if (tab === "systems") {
+                return [
+                    { id: "all", label: "All", count: data.systems.length },
+                    ...Object.keys(SYSTEM_STATES).map(status => ({
+                        id: status,
+                        label: SYSTEM_STATES[status].label,
+                        tone: SYSTEM_STATES[status].tone,
+                        count: countBy(data.systems, system => system.status === status)
+                    }))
+                ];
+            }
+            if (tab === "logs") {
+                return [
+                    { id: "all", label: "All recent", count: data.logs.length },
+                    { id: "problems", label: "Problems", tone: "bad", count: data.errors.length }
+                ];
+            }
+            return [];
+        }
+
+        function renderFilters(data) {
+            const state = tabs[activeTab];
+            filtersEl.innerHTML = filtersFor(activeTab, data)
+                .filter(filter => filter.id === "all" || filter.count > 0 || filter.id === state.filter || activeTab === "logs")
+                .map(filter => `<button type="button" class="af-chip" data-filter="${escapeHtml(filter.id)}" data-key="filter-${escapeHtml(filter.id)}" aria-pressed="${filter.id === state.filter}">
+                    ${filter.tone ? toneDot(filter.tone) : ""}${escapeHtml(filter.label)} <span class="af-chip-count">${formatNumber(filter.count)}</span>
+                </button>`)
+                .join("");
+        }
+
+        function matches(query, ...fields) {
+            if (!query) return true;
+            return fields.some(field => String(field ?? "").toLowerCase().includes(query));
+        }
+
+        function rowsFor(tab, data) {
+            const state = tabs[tab];
+            const query = state.query.trim().toLowerCase();
+            let rows;
+            if (tab === "targets") {
+                rows = data.reports
+                    .filter(report => state.filter === "all" || (state.filter === "blocked" ? isBlocked(report) : report.state === state.filter))
+                    .filter(report => matches(query, report.targetName, report.coordinate, report.reason, report.reasonDetail, targetState(report.state).label, report.reportId));
+            } else if (tab === "attacks") {
+                rows = data.attacks.filter(attack => matches(query, attack.targetName, attack.coordinate, attack.origin, attack.mission, attack.reportId));
+            } else if (tab === "systems") {
+                rows = data.systems
+                    .filter(system => state.filter === "all" || system.status === state.filter)
+                    .filter(system => matches(query, system.coordinate, system.reason, systemState(system.status).label));
+            } else {
+                rows = (state.filter === "problems" ? data.errors : data.logs)
+                    .filter(log => matches(query, log.message, log.sender, log.level));
+            }
+
+            if (!state.sort) return rows;
+            const { key, dir } = state.sort;
+            const value = row => key.endsWith("Utc") ? (parseTime(row[key]) ?? 0) : row[key];
+            return [...rows].sort((a, b) => {
+                const left = value(a);
+                const right = value(b);
+                const order = typeof left === "number" && typeof right === "number"
+                    ? left - right
+                    : String(left ?? "").localeCompare(String(right ?? ""), undefined, { numeric: true });
+                return order * dir;
+            });
+        }
+
+        function emptyHtml(tab, data) {
+            const state = tabs[tab];
+            if (state.query.trim() || state.filter !== "all") {
+                return `<p class="af-empty">Nothing matches this search or filter. <button type="button" class="af-link" data-clear data-key="clear">Clear them</button></p>`;
+            }
+            const messages = {
+                targets: "No espionage reports stored yet. Targets appear here once AutoFarm has probed them.",
+                attacks: "No fleet recorded yet. Attacks appear here after AutoFarm dispatches a fleet.",
+                systems: "No system scanned yet. AutoFarm fills this in as it reads the galaxy.",
+                logs: "No AutoFarm log lines today."
+            };
+            return `<p class="af-empty">${messages[tab]}</p>`;
+        }
+
+        function tableHtml(tab, columns, rows) {
+            const state = tabs[tab];
+            const head = columns.map(column => {
+                const align = column.cls ? ` class="${column.cls}"` : "";
+                if (!column.sort) return `<th scope="col"${align}>${column.label}</th>`;
+                const sorted = state.sort.key === column.sort;
+                const aria = sorted ? (state.sort.dir > 0 ? "ascending" : "descending") : "none";
+                const arrow = sorted ? (state.sort.dir > 0 ? "▲" : "▼") : "";
+                return `<th scope="col"${align} aria-sort="${aria}"><button type="button" class="af-sort" data-sort="${column.sort}" data-key="sort-${column.sort}">${column.label}<span aria-hidden="true">${arrow}</span></button></th>`;
+            }).join("");
+
+            const body = rows.slice(0, state.limit).map(row => `<tr>${columns.map(column => {
+                const align = column.cls ? ` class="${column.cls}"` : "";
+                return `<td data-label="${column.label}"${align}>${column.cell(row)}</td>`;
+            }).join("")}</tr>`).join("");
+
+            const left = rows.length - state.limit;
+            const more = left > 0
+                ? `<div class="af-more"><span>Showing ${formatNumber(state.limit)} of ${formatNumber(rows.length)}</span><button type="button" class="af-button" data-more data-key="more">Show ${formatNumber(Math.min(left, PAGE_SIZE))} more</button></div>`
+                : "";
+            return `<div class="af-table-wrap"><table class="af-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${more}`;
+        }
+
+        const targetColumns = [
+            { label: "Target", sort: "coordinate", cell: report => targetCellHtml(report.targetName, report.coordinate) },
+            { label: "Status", sort: "state", cell: report => `${stateBadge(targetState(report.state))}<span class="af-sub">Report #${formatNumber(report.reportId)}</span>` },
+            { label: "Why", cls: "af-wide", cell: reasonHtml },
+            { label: "Reported resources", sort: "totalResources", cls: "af-num", cell: resourcesHtml },
+            { label: "Updated", sort: "updatedAtUtc", cls: "af-num", cell: report => timeHtml(report.updatedAtUtc) }
+        ];
+
+        const attackColumns = [
+            { label: "Sent", sort: "dispatchedAtUtc", cell: attack => `${timeHtml(attack.dispatchedAtUtc)}<span class="af-sub">${escapeHtml(formatDate(attack.dispatchedAtUtc))}</span>` },
+            { label: "Target", sort: "coordinate", cell: attack => targetCellHtml(attack.targetName, attack.coordinate) },
+            { label: "From", sort: "origin", cell: attack => `<span class="af-coord af-coord-main">${escapeHtml(attack.origin)}</span><span class="af-sub">${escapeHtml(attack.mission)}</span>` },
+            { label: "Report", sort: "reportId", cls: "af-num", cell: attack => `#${formatNumber(attack.reportId)}` },
+            { label: "Reported resources", sort: "totalResources", cls: "af-num", cell: resourcesHtml }
+        ];
+
+        const systemColumns = [
+            { label: "System", sort: "coordinate", cell: system => `<span class="af-coord af-coord-main">${escapeHtml(system.coordinate)}</span>` },
+            { label: "Status", sort: "status", cell: system => stateBadge(systemState(system.status)) },
+            { label: "Why", cls: "af-wide", cell: system => `<span class="af-sub af-sub-flat">${escapeHtml(system.reason)}</span>` },
+            { label: "Last scan", sort: "lastScannedUtc", cls: "af-num", cell: system => timeHtml(system.lastScannedUtc) },
+            { label: "Next refresh", sort: "nextRefreshUtc", cls: "af-num", cell: system => timeHtml(system.nextRefreshUtc, "Due") }
+        ];
+
+        const logColumns = [
+            { label: "When", cell: log => timeHtml(log.dateTimeUtc) },
+            { label: "Level", cell: log => stateBadge({ label: log.level, tone: LOG_TONES[log.level] || "off" }) },
+            { label: "Source", cell: log => escapeHtml(log.sender) },
+            { label: "Message", cls: "af-wide af-log", cell: log => escapeHtml(log.message) }
+        ];
+
+        function scanMapHtml(data) {
+            const galaxies = new Map();
+            let width = 499;
+            data.systems.forEach(system => {
+                const [galaxy, number] = system.coordinate.split(":").map(Number);
+                if (!galaxies.has(galaxy)) galaxies.set(galaxy, []);
+                galaxies.get(galaxy).push({ number, system });
+                width = Math.max(width, number);
+            });
+            const { cursorGalaxy, cursorSystem } = data.scan;
+            if (cursorGalaxy > 0 && !galaxies.has(cursorGalaxy)) galaxies.set(cursorGalaxy, []);
+            if (!galaxies.size) return "";
+
+            const rows = [...galaxies.keys()].sort((a, b) => a - b).map(galaxy => {
+                const entries = galaxies.get(galaxy);
+                const cells = entries.map(({ number, system }) => {
+                    const meta = systemState(system.status);
+                    return `<rect x="${number - 1}" width="1" height="1" class="af-tone-${meta.tone}"><title>${galaxy}:${number} ${escapeHtml(meta.label)}, scanned ${escapeHtml(formatRelative(system.lastScannedUtc))}</title></rect>`;
+                }).join("");
+                const cursor = galaxy === cursorGalaxy
+                    ? `<span class="af-map-cursor" style="left:${((cursorSystem - 0.5) * 100 / width).toFixed(2)}%" title="Scan cursor at ${galaxy}:${cursorSystem}"></span>`
+                    : "";
+                return `<div class="af-map-row">
+                    <span class="af-map-label">Galaxy ${galaxy}</span>
+                    <div class="af-map-track">
+                        <svg viewBox="0 0 ${width} 1" preserveAspectRatio="none" shape-rendering="crispEdges" role="img" aria-label="Galaxy ${galaxy}: ${formatNumber(entries.length)} systems cached">${cells}</svg>
+                        ${cursor}
+                    </div>
+                    <span class="af-map-count">${formatNumber(entries.length)}</span>
+                </div>`;
+            }).join("");
+
+            const cursorText = cursorGalaxy > 0 ? `Scan cursor at ${cursorGalaxy}:${cursorSystem}, moved ${timeHtml(data.scan.cursorUpdatedAtUtc)}.` : "Scan cursor not set yet.";
+            return `<div class="af-map">
+                ${rows}
+                <p class="af-caption">${cursorText} Latest system seen ${timeHtml(data.lastSystemObservedAtUtc)}. Dark stretches have not been scanned.</p>
+            </div>`;
+        }
+
+        function renderResults(data) {
+            const rows = rowsFor(activeTab, data);
+            let html = "";
+            if (activeTab === "systems") html += scanMapHtml(data);
+            if (activeTab === "attacks") html += `<p class="af-caption">Only fleets recorded after a successful dispatch appear here.${data.attacks.length >= 100 ? " Showing the latest 100." : ""}</p>`;
+
+            if (!rows.length) {
+                resultsEl.innerHTML = html + emptyHtml(activeTab, data);
+                return;
+            }
+
+            const columns = { targets: targetColumns, attacks: attackColumns, systems: systemColumns, logs: logColumns }[activeTab];
+            resultsEl.innerHTML = html + tableHtml(activeTab, columns, rows);
+        }
+
+        function renderTools() {
+            copyEl.hidden = activeTab !== "logs";
+            searchEl.placeholder = tabs[activeTab].placeholder;
+            searchEl.setAttribute("aria-label", tabs[activeTab].placeholder);
+            searchEl.value = tabs[activeTab].query;
+        }
+
+        function keepFocus(render) {
+            const key = document.activeElement?.dataset?.key;
+            const top = window.scrollY;
+            render();
+            if (key) root.querySelector(`[data-key="${CSS.escape(key)}"]`)?.focus({ preventScroll: true });
+            // Bootstrap sets scroll-behavior: smooth on the root, which would fight an ongoing scroll.
+            if (window.scrollY !== top) window.scrollTo({ top, behavior: "instant" });
+        }
+
+        function draw() {
+            keepFocus(() => {
+                renderStatus(snapshot);
+                renderNotice(snapshot);
+                renderSummary(snapshot);
+                renderTabs(snapshot);
+                renderFilters(snapshot);
+                renderResults(snapshot);
+            });
+        }
+
+        function drawPanel() {
+            keepFocus(() => {
+                renderTabs(snapshot);
+                renderFilters(snapshot);
+                renderResults(snapshot);
+            });
+        }
+
+        function openTab(tab, filter) {
+            activeTab = tab;
+            if (filter) tabs[tab].filter = filter;
+            tabs[tab].limit = PAGE_SIZE;
+            history.replaceState(null, "", `#${tab}`);
+            renderTools();
+            drawPanel();
+        }
+
+        function setSort(key) {
+            const state = tabs[activeTab];
+            if (state.sort.key === key) {
+                state.sort.dir *= -1;
+            } else {
+                const newestFirst = key.endsWith("Utc") || key === "totalResources" || key === "reportId";
+                state.sort = { key, dir: newestFirst ? -1 : 1 };
+            }
+            drawPanel();
         }
 
         async function copyText(text, button) {
             const original = button.textContent;
+            let label;
             if (!text) {
-                button.textContent = "Nothing to copy";
-                setTimeout(() => button.textContent = original, 1800);
-                return;
+                label = "Nothing to copy";
+            } else {
+                try {
+                    await navigator.clipboard.writeText(text);
+                    label = "Copied";
+                } catch {
+                    label = "Copy failed";
+                }
             }
-            try {
-                await navigator.clipboard.writeText(text);
-                button.textContent = "Copied";
-                setTimeout(() => button.textContent = original, 1800);
-            } catch {
-                button.textContent = "Copy failed";
-                setTimeout(() => button.textContent = original, 1800);
-            }
+            button.textContent = label;
+            setTimeout(() => button.textContent = original, 1800);
         }
 
-        copyLogsButton.addEventListener("click", () => copyText(snapshot.logs.map(log => log.copyText).join("\n"), copyLogsButton));
-        document.addEventListener("click", event => {
-            const button = event.target.closest(".copy-errors");
-            if (!button) return;
-            copyText(snapshot.errors.map(log => log.copyText).join("\n"), button);
+        root.addEventListener("click", event => {
+            const target = event.target.closest("button");
+            if (!target) return;
+            const { tab, go, filter, sort } = target.dataset;
+
+            if (tab) {
+                openTab(tab);
+            } else if (go) {
+                const [goTab, goFilter] = go.split(":");
+                openTab(goTab, goFilter);
+                panelEl.scrollIntoView({ block: "nearest" });
+            } else if (filter) {
+                tabs[activeTab].filter = filter;
+                tabs[activeTab].limit = PAGE_SIZE;
+                drawPanel();
+            } else if (sort) {
+                setSort(sort);
+            } else if ("more" in target.dataset) {
+                tabs[activeTab].limit += PAGE_SIZE;
+                drawPanel();
+            } else if ("clear" in target.dataset) {
+                tabs[activeTab].filter = "all";
+                tabs[activeTab].query = "";
+                renderTools();
+                drawPanel();
+                searchEl.focus();
+            }
         });
+
+        root.querySelector("[role=tablist]").addEventListener("keydown", event => {
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+            const names = Object.keys(tabs);
+            const step = event.key === "ArrowRight" ? 1 : -1;
+            const next = names[(names.indexOf(activeTab) + step + names.length) % names.length];
+            openTab(next);
+            $(`af-tab-${next}`).focus();
+        });
+
+        searchEl.addEventListener("input", () => {
+            tabs[activeTab].query = searchEl.value;
+            tabs[activeTab].limit = PAGE_SIZE;
+            drawPanel();
+        });
+
+        copyEl.addEventListener("click", () => {
+            copyText(rowsFor("logs", snapshot).map(log => log.copyText).join("\n"), copyEl);
+        });
+
+        $("instance")?.addEventListener("change", () => $("af-instance-form").submit());
+
+        // A refresh must not wipe a selection someone is about to copy.
+        function isSelectingResults() {
+            const selection = window.getSelection();
+            return Boolean(selection && !selection.isCollapsed && resultsEl.contains(selection.anchorNode));
+        }
+
+        function setLive(failure) {
+            const time = lastSync ? lastSync.toLocaleTimeString() : "";
+            liveEl.classList.toggle("af-live-bad", Boolean(failure));
+            liveEl.textContent = failure
+                ? `Live updates stopped (${failure}). ${time ? `Showing data from ${time}.` : "Showing data from the page load."}`
+                : `Live, updated ${time}`;
+        }
 
         async function refresh() {
             if (requestInProgress || document.hidden) return;
@@ -280,19 +676,30 @@
             try {
                 const response = await fetch(`${snapshotUrl}?instance=${encodeURIComponent(instance)}`, { cache: "no-store" });
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                render(await response.json());
-                pollStatus.textContent = "Live updates enabled";
-                lastUpdated.textContent = `Last updated ${new Date().toLocaleTimeString()}`;
+                const next = await response.json();
+                const nextKey = JSON.stringify(next);
+                snapshot = next;
+                lastSync = new Date();
+                if (nextKey !== dataKey && !isSelectingResults()) {
+                    dataKey = nextKey;
+                    draw();
+                } else {
+                    renderStatus(snapshot);
+                    tick();
+                }
+                setLive();
             } catch (error) {
-                pollStatus.textContent = "Live update failed. The last known data is still shown.";
-                lastUpdated.textContent = error.message;
+                setLive(error.message);
             } finally {
                 requestInProgress = false;
             }
         }
 
-        render(snapshot);
+        dataKey = JSON.stringify(snapshot);
+        renderTools();
+        draw();
         refresh();
-        window.setInterval(refresh, 5000);
+        window.setInterval(refresh, POLL_MS);
+        document.addEventListener("visibilitychange", refresh);
     })();
 </script>

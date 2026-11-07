@@ -3,6 +3,7 @@ using TBot.Ogame.Infrastructure.Models;
 
 namespace TBot.Ogame.Infrastructure {
 	public interface IOgameService {
+		Task<CombatSimulationResult> SimulateCombat(CombatSimulationRequest request, System.Threading.CancellationToken cancellationToken);
 		event EventHandler OnError;
 		void Initialize(Credentials credentials,
 				Device device,

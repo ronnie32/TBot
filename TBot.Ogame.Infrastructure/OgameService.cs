@@ -46,6 +46,18 @@ namespace TBot.Ogame.Infrastructure {
 			_logger = logger;
 		}
 
+		public OgameService(ILoggerService<OgameService> logger, HttpClient client) : this(logger) {
+			_client = client ?? throw new ArgumentNullException(nameof(client));
+		}
+
+		public async Task<CombatSimulationResult> SimulateCombat(CombatSimulationRequest request, CancellationToken cancellationToken) {
+			using var content = new StringContent(JsonConvert.SerializeObject(request,
+				new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore }), Encoding.UTF8, "application/json");
+			using var response = await _client.PostAsync("/bot/simulate-combat", content, cancellationToken);
+			response.EnsureSuccessStatusCode();
+			return await ManageResponse<CombatSimulationResult>(response);
+		}
+
 		public void Initialize(Credentials credentials,
 				Device device,
 				ProxySettings proxySettings,
@@ -255,6 +267,11 @@ namespace TBot.Ogame.Infrastructure {
 						$"An error has occurred (HTTP {(int) response.StatusCode} {response.ReasonPhrase})");
 				}
 				else if (result.Status != "ok") {
+					if (result.Message?.IndexOf("target is not ok", StringComparison.OrdinalIgnoreCase) >= 0) {
+						_logger.WriteLog(LogLevel.Error, LogSender.OGameD,
+							$"[FleetTargetDebug] Response HTTP {(int)response.StatusCode} {response.ReasonPhrase}; " +
+							$"status={result.Status}; code={result.Code}; message={result.Message}");
+					}
 					throw new OgamedException($"An error has occurred: Status Code: {response.StatusCode} Status: {result?.Status} - Message: {result?.Message}");
 				} else {
 					if (result.Result is JObject) {
@@ -299,6 +316,7 @@ namespace TBot.Ogame.Infrastructure {
 		}
 
 		private async Task<T> PostAsyncCore<T>(bool retry, string resource, KeyValuePair<string, string>[] parameters) {
+			LogFleetDispatchRequest(resource, parameters);
 			Func<Task<HttpResponseMessage>> send = async () => {
 				var request = new HttpRequestMessage() {
 					Method = HttpMethod.Post,
@@ -312,6 +330,19 @@ namespace TBot.Ogame.Infrastructure {
 				? await GetRetryPolicy().ExecuteAsync(send)
 				: await send();
 			return await ManageResponse<T>(response);
+		}
+
+		private void LogFleetDispatchRequest(string resource, KeyValuePair<string, string>[] parameters) {
+			if (!resource.Contains("/send-fleet", StringComparison.OrdinalIgnoreCase))
+				return;
+
+			var safeParameters = parameters
+				.Where(parameter => !string.Equals(parameter.Key, "token", StringComparison.OrdinalIgnoreCase))
+				.Where(parameter => !string.Equals(parameter.Key, "fleetSendingToken", StringComparison.OrdinalIgnoreCase))
+				.Select(parameter => $"{parameter.Key}={parameter.Value}");
+
+			_logger.WriteLog(LogLevel.Debug, LogSender.OGameD,
+				$"[FleetTargetDebug] Request {resource}; {string.Join("; ", safeParameters)}");
 		}
 
 		public async Task SetUserAgent(string userAgent) {
@@ -908,7 +939,9 @@ namespace TBot.Ogame.Infrastructure {
 				parameters.Add(new KeyValuePair<string, string>("deuterium", payload.Deuterium.ToString()));
 				parameters.Add(new KeyValuePair<string, string>("food", payload.Food.ToString()));
 
-				return await PostAsync<Fleet>($"/bot/planets/{origin.ID}/send-fleet", parameters.ToArray());
+				// A failed response can follow a successful dispatch. Repeating this
+				// POST duplicates fleets; FleetScheduler reconciles the fleet list.
+				return await PostAsyncNoRetry<Fleet>($"/bot/planets/{origin.ID}/send-fleet", parameters.ToArray());
 			} catch (OgamedException e) when (e.Message.Contains("no ships to send")) {
 				return null;
 			}

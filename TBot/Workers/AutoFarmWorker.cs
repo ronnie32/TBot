@@ -14,6 +14,7 @@ using TBot.Model;
 using TBot.Ogame.Infrastructure.Models;
 using TBot.Ogame.Infrastructure;
 using Tbot.Common.Settings;
+using Newtonsoft.Json;
 
 namespace Tbot.Workers {
 	public class AutoFarmWorker : WorkerBase {
@@ -24,7 +25,9 @@ namespace Tbot.Workers {
 		private readonly AutoFarmBlacklist _blacklist;
 		private readonly AutoFarmSuccessfulTargets _successfulTargets;
 		private readonly AutoFarmStateStore _stateStore;
+		private readonly AutoFarmCombatJournal _combatJournal;
 		private readonly HashSet<int> _autoFarmEspionageFleetIds = new();
+		private readonly HashSet<int> _combatDeferredReports = new();
 		private bool _stateLoaded;
 		private bool _lastSystemScanUsedEmptyCooldown;
 		public AutoFarmWorker(ITBotMain parentInstance,
@@ -42,6 +45,7 @@ namespace Tbot.Workers {
 			string successfulPath = $"autofarm_successful_{_tbotInstance.InstanceAlias}.json";
 			_successfulTargets = new AutoFarmSuccessfulTargets(successfulPath);
 			_stateStore = new AutoFarmStateStore($"autofarm_{_tbotInstance.InstanceAlias}.db");
+			_combatJournal = new AutoFarmCombatJournal(_tbotInstance.InstanceAlias);
 		}
 		public override bool IsWorkerEnabledBySettings() {
 			try {
@@ -155,8 +159,26 @@ namespace Tbot.Workers {
 		private bool AttackTargetsWithFleetEnabled() => GetAutoFarmBoolean("AttackTargetsWithFleet", false);
 		private bool IgnoreMissiles() => GetAutoFarmBoolean("IgnoreMissiles", true);
 
+		private AutoFarmCombatSettings GetCombatSettings() {
+			if (!SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "CombatPlanner"))
+				return new AutoFarmCombatSettings();
+			return JsonConvert.DeserializeObject<AutoFarmCombatSettings>(JsonConvert.SerializeObject(
+				(object)_tbotInstance.InstanceSettings.AutoFarm.CombatPlanner))
+				?? throw new InvalidOperationException("Missing CombatPlanner settings.");
+		}
+
+		private AutoFarmCombatContext GetCombatContext(Buildables cargoType) => new() {
+			Researches = _tbotInstance.UserData.researches, Server = _tbotInstance.UserData.serverData,
+			PlayerClass = _tbotInstance.UserData.userInfo.Class, AllianceClass = _tbotInstance.UserData.allianceClass,
+			CargoType = cargoType, MinCargosToKeep = GetAutoFarmLong("MinCargosToKeep", 0),
+			MinCargosToSend = GetAutoFarmLong("MinCargosToSend", 1), FleetSpeed = (int)GetAutoFarmLong("FleetSpeed", 100),
+			CargoSurplusPercentage = SettingsService.GetSetting<decimal>(_tbotInstance.InstanceSettings.AutoFarm, "CargoSurplusPercentage", 10M),
+			MaxFlightTime = GetAutoFarmLong("MaxFlightTime", 0),
+			MinLootFuelRatio = SettingsService.GetSetting<decimal>(_tbotInstance.InstanceSettings.AutoFarm, "MinLootFuelRatio", 0M)
+		};
+
 		private AutoFarmReportDecision EvaluateReport(EspionageReport report) {
-			return AutoFarmReportPolicy.Evaluate(
+			var decision = AutoFarmReportPolicy.Evaluate(
 				report,
 				GetAutoFarmLong("MinimumResources", 1000000),
 				Convert.ToString(_tbotInstance.InstanceSettings.AutoFarm.PreferedResource) ?? string.Empty,
@@ -166,6 +188,51 @@ namespace Tbot.Workers {
 				IgnoreMissiles(),
 				GetAutoFarmLong("MaxDefensePoints", 0),
 				GetAutoFarmLong("MaxFleetPoints", 0));
+			if (decision.Kind == AutoFarmReportDecisionKind.AttackPending && GetCombatSettings().Active &&
+				(report.GetFleetResourceValue() > 0 || report.HasDefensiveStructures(false) || report.SolarSatellite.GetValueOrDefault() > 0 || report.Crawler.GetValueOrDefault() > 0) &&
+				(!report.WeaponsTechnology.HasValue || !report.ShieldingTechnology.HasValue || !report.ArmourTechnology.HasValue))
+				return new(AutoFarmReportDecisionKind.NeedMoreInformation, "CombatTechnologiesRequired");
+			if (decision.Kind == AutoFarmReportDecisionKind.AttackPending && GetCombatSettings().Active &&
+				!AutoFarmCombatPlanner.ReportIsRecent(report, GetCombatSettings()))
+				return new(AutoFarmReportDecisionKind.NeedMoreInformation, "RecentCombatReportRequired");
+			return decision;
+		}
+
+		private async Task<bool> RequestRequiredCombatReports() {
+			var required = _tbotInstance.UserData.farmTargets.Where(target =>
+				target.State == FarmState.ProbesRequired || target.State == FarmState.FailedProbesRequired ||
+				target.State == FarmState.ProbesPending && target.Report != null &&
+				(!target.Report.WeaponsTechnology.HasValue || !target.Report.ShieldingTechnology.HasValue || !target.Report.ArmourTechnology.HasValue)).ToList();
+			if (GetCombatSettings().ObservationOnly) {
+				_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, "Observation only: additional probes are not dispatched.");
+				return required.Count > 0;
+			}
+			foreach (var target in required) {
+				_ct.ThrowIfCancellationRequested();
+				_tbotInstance.UserData.slots = await _ogameService.GetSlots();
+				_tbotInstance.UserData.fleets = await RefreshFleetSnapshotOrThrow("combat report retry");
+				if (GetCurrentSlotBudget(GetConfiguredCargoType()).AvailableSlots <= 0) break;
+				var probes = GetNeededProbes(target);
+				if (probes <= 0) throw new InvalidOperationException("AutoFarm.NumProbes must be positive.");
+				foreach (var origin in GetFarmOrigins().OrderBy(origin => _calculationService.CalcDistance(
+					origin.Coordinate, target.Celestial.Coordinate, _tbotInstance.UserData.serverData))) {
+					var fresh = await _tbotOgameBridge.UpdatePlanet(origin, UpdateTypes.Ships);
+					if ((fresh.Ships?.EspionageProbe ?? 0) < probes) continue;
+					var fleetId = await _fleetScheduler.SendValidatedFleet(fresh, new Ships(espionageProbe: probes),
+						target.Celestial.Coordinate, Missions.Spy, Speeds.HundredPercent, beforeDispatch: _ => !GetCombatSettings().ObservationOnly);
+					if (fleetId > (int)SendFleetCode.GenericError) {
+						target.ProbeLevel = GetProbeLevelForDispatch(target);
+						target.ProbeFleetId = fleetId; target.ProbeSentAtUtc = DateTime.UtcNow;
+						target.State = FarmState.ProbesSent; _autoFarmEspionageFleetIds.Add(fleetId);
+						PersistTargets();
+						_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+							$"Requested a complete combat report for {target.Celestial.Coordinate} with {probes} probes.");
+					}
+					break;
+				}
+			}
+			return _tbotInstance.UserData.farmTargets.Any(target => target.State == FarmState.ProbesRequired ||
+				target.State == FarmState.FailedProbesRequired || target.State == FarmState.ProbesSent);
 		}
 
 		private void ApplyReportDecision(FarmTarget target, EspionageReport report) {
@@ -174,6 +241,11 @@ namespace Tbot.Workers {
 
 			var decision = EvaluateReport(report);
 			if (decision.Kind == AutoFarmReportDecisionKind.NeedMoreInformation) {
+				if (GetCombatSettings().ObservationOnly) {
+					target.State = FarmState.ProbesRequired;
+					_combatJournal.Append(report, GetCombatSettings(), GetCombatContext(GetConfiguredCargoType()), null, decision.Reason);
+					return;
+				}
 				var probeLevel = target.ProbeLevel;
 				if (probeLevel == 0 && target.State == FarmState.ProbesRequired)
 					probeLevel = 1;
@@ -661,12 +733,13 @@ namespace Tbot.Workers {
 			return AutoFarmSlotPlanner.Calculate(
 				(int) _tbotInstance.InstanceSettings.AutoFarm.MaxSlots,
 				(int) (_tbotInstance.UserData.slots?.Free ?? 0),
-				(int) _tbotInstance.InstanceSettings.General.SlotsToLeaveFree,
+				Math.Max((int)_tbotInstance.InstanceSettings.General.SlotsToLeaveFree, (int)GetAutoFarmLong("SlotsToLeaveFree", 0)),
 				_tbotInstance.UserData.fleets,
 				cargoType,
 				_autoFarmEspionageFleetIds,
 				AttackDefendedTargetsEnabled(),
-				AttackTargetsWithFleetEnabled());
+				AttackTargetsWithFleetEnabled(),
+				GetCombatSettings().Active);
 		}
 
 		private async Task<List<Fleet>> RefreshFleetSnapshotOrThrow(string phase) {
@@ -870,6 +943,7 @@ namespace Tbot.Workers {
 			int skippedEmptySystems = 0;
 			try {
 				_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, "Running autofarm...");
+				GetCombatSettings().Validate();
 				LoadPersistedTargets();
 				finishedFullScan = _tbotInstance.UserData.autoFarmReportPhasePending;
 				stopAfterFullScan = SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "StopAfterFullScan")
@@ -891,6 +965,8 @@ namespace Tbot.Workers {
 						_tbotInstance.UserData.fleets = await RefreshFleetSnapshotOrThrow("startup");
 						RestoreOwnedEspionageMissions(_tbotInstance.UserData.fleets);
 						await PruneOldReports(_tbotInstance.UserData.fleets);
+						_combatDeferredReports.IntersectWith(_tbotInstance.UserData.farmTargets
+							.Where(target => target.State == FarmState.AttackPending).Select(target => target.Report?.ID ?? 0));
 						PersistTargets();
 
 						var farmOrigins = GetFarmOrigins();
@@ -899,7 +975,8 @@ namespace Tbot.Workers {
 
 						int numProbed = 0;
 
-						if (_tbotInstance.UserData.farmTargets.Any(target => target.State == FarmState.AttackPending)) {
+						if (_tbotInstance.UserData.farmTargets.Any(target => target.State == FarmState.AttackPending &&
+							!_combatDeferredReports.Contains(target.Report?.ID ?? 0))) {
 							_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
 								"Resuming pending attacks before scanning more systems.");
 						} else if (_tbotInstance.UserData.autoFarmReportPhasePending) {
@@ -1164,7 +1241,11 @@ namespace Tbot.Workers {
 											continue;
 										}
 
-										var fleetId = await _fleetScheduler.SendValidatedFleet(bestOrigin.Origin, ships, target.Celestial.Coordinate, Missions.Spy, Speeds.HundredPercent);
+                                        if (GetCombatSettings().ObservationOnly) {
+                                            _tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, "Observation only: scan probes are not dispatched.");
+                                            continue;
+                                        }
+										var fleetId = await _fleetScheduler.SendValidatedFleet(bestOrigin.Origin, ships, target.Celestial.Coordinate, Missions.Spy, Speeds.HundredPercent, beforeDispatch: _ => !GetCombatSettings().ObservationOnly);
 
 										if (fleetId > (int) SendFleetCode.GenericError) {
 											freeSlots--;
@@ -1239,11 +1320,16 @@ namespace Tbot.Workers {
 					_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, "Processing espionage reports of found inactives...");
 
 					reportPhaseCompleted = await AutoFarmProcessReports();
+					if (GetCombatSettings().Active && await RequestRequiredCombatReports())
+						reportPhaseCompleted = false;
 					PersistTargets();
 
 					_tbotInstance.UserData.slots = await _tbotOgameBridge.UpdateSlots();
 					_tbotInstance.UserData.fleets = await RefreshFleetSnapshotOrThrow("attack preparation");
 					Buildables configuredCargoType = GetConfiguredCargoType();
+					var combatSettings = GetCombatSettings();
+					if (combatSettings.Active) combatSettings.Validate();
+					var combatPlanner = new AutoFarmCombatPlanner(_ogameService, _calculationService);
 					List<RankSlotsPriority> rankSlotsPriority = new() {
 						new RankSlotsPriority(Feature.BrainAutoMine,
 							(int) _tbotInstance.InstanceSettings.General.SlotPriorityLevel.Brain,
@@ -1264,7 +1350,7 @@ namespace Tbot.Workers {
 											configuredCargoType,
 											_autoFarmEspionageFleetIds,
 											AttackDefendedTargetsEnabled(),
-											AttackTargetsWithFleetEnabled()))),
+											AttackTargetsWithFleetEnabled(), combatSettings.Active))),
 						new RankSlotsPriority(Feature.Colonize,
 							(int) _tbotInstance.InstanceSettings.General.SlotPriorityLevel.Colonize,
 							(bool) _tbotInstance.InstanceSettings.AutoColonize.Active,
@@ -1346,6 +1432,7 @@ namespace Tbot.Workers {
 						}
 						var numCargo = 0L;
 						var attackingShips = new Ships();
+						AutoFarmCombatPlan combatPlan = null;
 
 						List<Celestial> tempCelestials = (_tbotInstance.InstanceSettings.AutoFarm.Origin.Length > 0) ? _calculationService.ParseCelestialsList(_tbotInstance.InstanceSettings.AutoFarm.Origin, _tbotInstance.UserData.celestials) : _tbotInstance.UserData.celestials;
 						List<Celestial> closestCelestials = tempCelestials
@@ -1353,8 +1440,41 @@ namespace Tbot.Workers {
 							.ThenByDescending(c => c.Coordinate.Type == Celestials.Moon)
 							.ToList();
 
-						Celestial tempCelestial;
 						Celestial fromCelestial = null;
+						if (combatSettings.Active) {
+							try {
+								var origins = new List<Celestial>();
+								foreach (var origin in closestCelestials) {
+									var fresh = await _tbotOgameBridge.UpdatePlanet(origin, UpdateTypes.Ships);
+									fresh = await _tbotOgameBridge.UpdatePlanet(fresh, UpdateTypes.Resources);
+									fresh = await _tbotOgameBridge.UpdatePlanet(fresh, UpdateTypes.LFBonuses);
+									origins.Add(fresh);
+								}
+								var planning = await combatPlanner.PlanAsync(target.Report, origins, GetCombatContext(cargoShip), combatSettings, _ct);
+								combatPlan = planning.Plan;
+								if (combatPlan == null) {
+									_combatJournal.Append(target.Report, combatSettings, GetCombatContext(cargoShip), null, planning.Reason);
+									_combatDeferredReports.Add(target.Report.ID);
+									_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+										$"Combat planner skipped {target.Celestial.Coordinate}: {planning.Reason} ({planning.EvaluatedCandidates} candidates).");
+									continue;
+								}
+								fromCelestial = combatPlan.Origin; attackingShips = combatPlan.Ships;
+								_combatDeferredReports.Remove(target.Report.ID);
+								numCargo = attackingShips.GetAmount(cargoShip); speed = combatPlan.Speed;
+								_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+									$"Combat planner selected {combatPlan.Strategy} from {fromCelestial.Coordinate}: {attackingShips}; " +
+									$"{combatPlan.Simulation.AttackerWins}/{combatPlan.Simulation.Runs} sampled wins, worst sampled loss {combatPlan.Simulation.MaxAttackerLoss:N0}, " +
+									$"net profit {combatPlan.NetProfit:N0}, profit/hour {combatPlan.ProfitPerHour:N0}, {planning.EvaluatedCandidates} candidates.");
+							} catch (OperationCanceledException) when (_ct.IsCancellationRequested) { throw; }
+							catch (Exception error) {
+								_combatDeferredReports.Add(target.Report.ID);
+								_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm,
+									$"Combat planning failed for {target.Celestial.Coordinate}; no fleet sent: {error.Message}");
+								continue;
+							}
+						} else {
+						Celestial tempCelestial;
 						foreach (var c in closestCelestials) {
 							tempCelestial = await _tbotOgameBridge.UpdatePlanet(c, UpdateTypes.Ships);
 							tempCelestial = await _tbotOgameBridge.UpdatePlanet(tempCelestial, UpdateTypes.Resources);
@@ -1523,6 +1643,7 @@ namespace Tbot.Workers {
 							}
 						}
 
+						}
 						if (fromCelestial == null) {
 							_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, $"Unable to attack {target.Celestial.Coordinate}. No suitable origin celestial available near the destination.");
 							continue;
@@ -1534,6 +1655,29 @@ namespace Tbot.Workers {
 						if (MaxSlots > 0 && slotBudget.AvailableSlots > 0) {
 							fromCelestial = await _tbotOgameBridge.UpdatePlanet(fromCelestial, UpdateTypes.Ships);
 							fromCelestial = await _tbotOgameBridge.UpdatePlanet(fromCelestial, UpdateTypes.LFBonuses);
+							if (combatPlan != null) {
+								try {
+									fromCelestial = await _tbotOgameBridge.UpdatePlanet(fromCelestial, UpdateTypes.Resources);
+									_tbotInstance.UserData.researches = await _ogameService.GetResearches();
+									combatPlan = await combatPlanner.RevalidateAsync(combatPlan with { Origin = fromCelestial }, target.Report,
+										GetCombatContext(cargoShip), combatSettings, _ct);
+									if (combatPlan == null) {
+										_combatJournal.Append(target.Report, combatSettings, GetCombatContext(cargoShip), null, "FinalConfirmationRejected");
+										_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, "Combat plan no longer feasible after inventory and bonus refresh; no fleet sent.");
+										continue;
+									}
+									attackingShips = combatPlan.Ships; speed = combatPlan.Speed;
+									numCargo = attackingShips.GetAmount(cargoShip);
+									_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+										$"Combat planner confirmed {attackingShips}; {combatPlan.Simulation.AttackerWins}/{combatPlan.Simulation.Runs} sampled wins, " +
+										$"worst sampled loss {combatPlan.Simulation.MaxAttackerLoss:N0}, net profit {combatPlan.NetProfit:N0}, " +
+										$"speed {combatPlan.Speed * 10:0.#}%, fuel {combatPlan.Fuel:N0}, round trip {TimeSpan.FromSeconds(2 * combatPlan.FlightTime)}.");
+								} catch (OperationCanceledException) when (_ct.IsCancellationRequested) { throw; }
+								catch (Exception error) {
+									_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm, $"Combat revalidation failed; no fleet sent: {error.Message}");
+									continue;
+								}
+							}
 							var availableShips = (fromCelestial.Ships?.GetAmount(cargoShip) ?? 0) - (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep;
 							var finalCargo = Math.Min(Math.Max(0, availableShips), numCargo);
 							if (finalCargo < (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToSend) {
@@ -1544,7 +1688,7 @@ namespace Tbot.Workers {
 								_tbotInstance.log(LogLevel.Debug, LogSender.AutoFarm, $"Only {finalCargo} {cargoShip.ToString()} available (needed {numCargo}). Adjusting fleet size.");
 
 							numCargo = finalCargo;
-							attackingShips = BuildAttackFleet(numCargo, cargoShip, target.Report);
+							if (combatPlan == null) attackingShips = BuildAttackFleet(numCargo, cargoShip, target.Report);
 							if (!fromCelestial.Ships.HasAtLeast(attackingShips)) {
 								_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
 									$"No complete attack fleet available on {fromCelestial}; required {attackingShips}, available {fromCelestial.Ships}.");
@@ -1565,6 +1709,7 @@ namespace Tbot.Workers {
 							_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, $"Attacking {target.ToString()} from {fromCelestial} with {numCargo} {cargoShip.ToString()}.");
 							Ships ships = new();
 
+							if (combatPlan == null) {
 							speed = 0;
 							if (SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "MinLootFuelRatio") && _tbotInstance.InstanceSettings.AutoFarm.MinLootFuelRatio != 0) {
 								long maxFlightTime = SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "MaxFlightTime") ? (long) _tbotInstance.InstanceSettings.AutoFarm.MaxFlightTime : 86400;
@@ -1589,7 +1734,38 @@ namespace Tbot.Workers {
 								}
 							}
 
-							var fleetId = await _fleetScheduler.SendValidatedFleet(fromCelestial, attackingShips, target.Celestial.Coordinate, Missions.Attack, speed);
+							}
+							if (combatPlan != null) {
+								try {
+									var predictionId = _combatJournal.Append(target.Report, combatSettings, GetCombatContext(cargoShip), combatPlan, "Confirmed");
+									_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, $"Combat prediction recorded: {predictionId}.");
+								} catch (Exception error) {
+									_combatDeferredReports.Add(target.Report.ID);
+									_tbotInstance.log(LogLevel.Error, LogSender.AutoFarm, $"Combat prediction persistence failed; no fleet sent: {error.Message}");
+									continue;
+								}
+								if (combatSettings.ObservationOnly) {
+									_combatDeferredReports.Add(target.Report.ID);
+									_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, "Observation only: confirmed attack retained without dispatch.");
+									continue;
+								}
+							}
+							Func<Celestial, bool> beforeDispatch = _ => !GetCombatSettings().ObservationOnly;
+							if (combatPlan != null) {
+								var confirmedSettings = JsonConvert.SerializeObject(combatSettings);
+								var confirmedBonuses = JsonConvert.SerializeObject(fromCelestial.LFBonuses);
+								var confirmedContext = JsonConvert.SerializeObject(GetCombatContext(cargoShip));
+								var confirmedReport = JsonConvert.SerializeObject(target.Report);
+								beforeDispatch = refreshed => !_ct.IsCancellationRequested && !GetCombatSettings().ObservationOnly &&
+									AutoFarmCombatPlanner.ReportIsRecent(target.Report, combatSettings) &&
+									JsonConvert.SerializeObject(GetCombatSettings()) == confirmedSettings &&
+									GetCurrentSlotBudget(cargoShip).AvailableSlots > 0 &&
+									JsonConvert.SerializeObject(refreshed.LFBonuses) == confirmedBonuses &&
+									JsonConvert.SerializeObject(GetCombatContext(cargoShip)) == confirmedContext &&
+									JsonConvert.SerializeObject(target.Report) == confirmedReport;
+							}
+							var fleetId = await _fleetScheduler.SendValidatedFleet(fromCelestial, attackingShips, target.Celestial.Coordinate, Missions.Attack, speed,
+								beforeDispatch: beforeDispatch);
 
 							if (fleetId > (int) SendFleetCode.GenericError) {
 								freeSlots--;
@@ -1629,6 +1805,13 @@ namespace Tbot.Workers {
 				_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm, $"Stacktrace: {e.StackTrace}");
 			} finally {
 				PersistTargets();
+				var combatDeferred = _tbotInstance.UserData.farmTargets.Where(target => target.State == FarmState.AttackPending).ToList();
+				if (finishedFullScan && reportPhaseCompleted && combatDeferred.Count > 0 &&
+					combatDeferred.All(target => _combatDeferredReports.Contains(target.Report?.ID ?? 0))) {
+					SaveScanCursor(0, 0, 0);
+					_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+						$"Keeping {combatDeferred.Count} deferred combat target(s) for retry; continuing scans to find other profitable targets.");
+				}
 				if (AutoFarmCyclePolicy.CanFinalizeFullScan(finishedFullScan, reportPhaseCompleted,
 					_tbotInstance.UserData.farmTargets.Any(target => target.State == FarmState.AttackPending))) {
 					SaveScanCursor(0, 0, 0);
@@ -1663,6 +1846,7 @@ namespace Tbot.Workers {
 		}
 
 		private async Task<bool> TryDeleteEspionageReport(int reportId, string reason) {
+			if (GetCombatSettings().ObservationOnly) return false;
 			if (reportId <= 0)
 				return false;
 
