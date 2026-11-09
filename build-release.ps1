@@ -1,7 +1,7 @@
 param(
-    [string]$Version = '3.6.0-beta1',
-    [string]$AssemblyVersion = '3.6.0.1',
-    [string]$ReleaseName = 'release-build-3.6.0-beta1'
+    [string]$Version = '3.6.0-beta2',
+    [string]$AssemblyVersion = '3.6.0.2',
+    [string]$ReleaseName = 'release-build-3.6.0-beta2'
 )
 
 $ErrorActionPreference = 'Stop'

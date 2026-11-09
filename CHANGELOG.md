@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.6.0-beta2
+
+> **Beta warning:** Safe and Balanced are experimental and can lose ships. Start in observation-only mode. User feedback is needed.
+
+### Fixed
+
+#### AutoFarm
+
+- Fixed ship inventory requests losing the origin ID when the planet or moon is missing from the cache.
+- Read stock counters by technology ID; reject malformed inventories and responses for another origin instead of using incorrect ship counts.
+
+Build version: **3.6.0.2**
+Release channel: **Beta**
+
 ## v3.6.0-beta1
 
 > **Beta warning:** Safe and Balanced are experimental and can lose ships. Start in observation-only mode. User feedback is needed: share your profile, settings, prediction and combat result, without private account data.
