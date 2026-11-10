@@ -42,6 +42,47 @@ namespace Tbot.Workers {
 			_cursor = _selectionRanks[NormalizeIndex(startIndex, activeCounts.Count)];
 		}
 
+		private ExpeditionDispatchPlanner(ExpeditionDispatchPlanner source) {
+			_initialActiveCounts = (int[])source._initialActiveCounts.Clone();
+			_localDispatchCounts = (int[])source._localDispatchCounts.Clone();
+			_activeCounts = (int[])source._activeCounts.Clone();
+			_unavailable = (bool[])source._unavailable.Clone();
+			_attemptedThisRound = (bool[])source._attemptedThisRound.Clone();
+			_selectionOrder = (int[])source._selectionOrder.Clone();
+			_selectionRanks = (int[])source._selectionRanks.Clone();
+			_maxPerOrigin = source._maxPerOrigin;
+			_cursor = source._cursor;
+			_successfulDispatchesThisRound = source._successfulDispatchesThisRound;
+		}
+
+		/// <summary>
+		/// Counts this origin's pending sends, including its already selected current
+		/// send. Forecasts successful dispatches on a copy, preserving live round,
+		/// cursor, exclusions and local confirmations without any network requests.
+		/// </summary>
+		public int CountPendingDispatches(int originIndex, int requested) {
+			ValidateIndex(originIndex);
+			if (requested <= 0 || _unavailable[originIndex] || _activeCounts[originIndex] >= _maxPerOrigin)
+				return 0;
+
+			var forecast = new ExpeditionDispatchPlanner(this);
+			var count = 1;
+			forecast.MarkSent(originIndex);
+			for (var sent = 1; sent < requested;) {
+				var next = forecast.SelectNextOrigin();
+				if (!next.HasValue) {
+					if (!forecast.BeginNextRound())
+						break;
+					continue;
+				}
+				if (next.Value == originIndex)
+					count++;
+				forecast.MarkSent(next.Value);
+				sent++;
+			}
+			return count;
+		}
+
 		public int? SelectNextOrigin() {
 			var selectedIndex = -1;
 			var selectedLoad = int.MaxValue;

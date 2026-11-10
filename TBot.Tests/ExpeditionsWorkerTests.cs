@@ -13,7 +13,7 @@ using TBot.Ogame.Infrastructure.Models;
 using Xunit;
 
 namespace TBot.Tests {
-	public class ExpeditionsWorkerTests {
+	public partial class ExpeditionsWorkerTests {
 		[Fact]
 		public async Task FixedOrderSkipsAnEmptyOriginAndFillsTheHealthyOriginsFairly() {
 			var origins = new[] {

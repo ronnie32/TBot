@@ -127,7 +127,9 @@ namespace Tbot.Workers {
 				(long)_tbotInstance.InstanceSettings.Expeditions.ManualShips.Ships.Pathfinder);
 		}
 
-		private Ships BuildExpeditionFleet(Celestial origin, LFBonuses lfBonuses) {
+		private Ships BuildExpeditionFleet(Celestial origin, LFBonuses lfBonuses, int pendingFromOrigin) {
+			if (pendingFromOrigin <= 0)
+				return new Ships();
 			if ((bool)_tbotInstance.InstanceSettings.Expeditions.ManualShips.Active)
 				return BuildManualExpeditionFleet();
 
@@ -139,14 +141,21 @@ namespace Tbot.Workers {
 			if (primaryShip == Buildables.Null)
 				return new Ships();
 
-			var availableShips = origin.Ships?.GetMovableShips() ?? new Ships();
+			// Reserves must not alter the shared, freshly read origin snapshot.
+			var availableShips = new Ships();
+			if (origin.Ships != null)
+				foreach (var property in typeof(Ships).GetProperties())
+					property.SetValue(availableShips, property.GetValue(origin.Ships));
+			availableShips = availableShips.GetMovableShips();
 			if (SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.Expeditions, "PrimaryToKeep") &&
 				(int)_tbotInstance.InstanceSettings.Expeditions.PrimaryToKeep > 0) {
 				availableShips.SetAmount(primaryShip, Math.Max(0,
 					availableShips.GetAmount(primaryShip) - (long)_tbotInstance.InstanceSettings.Expeditions.PrimaryToKeep));
 			}
 
-			return _calculationService.CalcFullExpeditionShips(
+			// Keep one-flight escort selection: a scarce escort can join this send
+			// even when there are not enough of that type for every pending fleet.
+			var fleet = _calculationService.CalcFullExpeditionShips(
 				availableShips,
 				primaryShip,
 				1,
@@ -155,6 +164,48 @@ namespace Tbot.Workers {
 				lfBonuses,
 				_tbotInstance.UserData.userInfo.Class,
 				_tbotInstance.UserData.serverData.ProbeCargo);
+			var availablePrimary = Math.Max(0, availableShips.GetAmount(primaryShip));
+			var primaryShare = availablePrimary / pendingFromOrigin;
+			if (availablePrimary % pendingFromOrigin != 0)
+				primaryShare++;
+			fleet.SetAmount(primaryShip, Math.Min(fleet.GetAmount(primaryShip), primaryShare));
+			return AddSecondaryExpeditionShips(fleet, availableShips, primaryShip, pendingFromOrigin);
+		}
+
+		private Ships AddSecondaryExpeditionShips(Ships fleet, Ships availableShips, Buildables primaryShip, int pendingFromOrigin) {
+			var settings = _tbotInstance.InstanceSettings.Expeditions;
+			string configuredShip = SettingsService.GetSetting<string>(settings, "SecondaryShip", "Null");
+			if (!Enum.TryParse<Buildables>(configuredShip, true, out var secondaryShip))
+				throw new ArgumentException("Expeditions.SecondaryShip must name a movable ship or Null.");
+			if (secondaryShip == Buildables.Null)
+				return fleet;
+			if (secondaryShip == primaryShip || secondaryShip == Buildables.SolarSatellite || secondaryShip == Buildables.Crawler ||
+				typeof(Ships).GetProperty(secondaryShip.ToString()) == null)
+				throw new ArgumentException("Expeditions.SecondaryShip must be a movable ship different from PrimaryShip.");
+
+			decimal ratio = SettingsService.GetSetting<decimal>(settings, "SecondaryToPrimaryRatio", 2M);
+			long minimum = SettingsService.GetSetting<long>(settings, "MinSecondaryToSend", 0L);
+			if (ratio < 0 || minimum < 0)
+				throw new ArgumentException("Expeditions.SecondaryToPrimaryRatio and MinSecondaryToSend must be non-negative.");
+
+			// An escort may already use this type. Only unselected stock can be added.
+			var stock = Math.Max(0, availableShips.GetAmount(secondaryShip));
+			var available = Math.Max(0, stock - Math.Max(0, fleet.GetAmount(secondaryShip)));
+			var share = available / pendingFromOrigin;
+			if (available % pendingFromOrigin != 0)
+				share++;
+			var primaryCount = Math.Max(0, fleet.GetAmount(primaryShip));
+			// Compare before multiplication to saturate even extremely large configured ratios.
+			var ratioLimit = primaryCount == 0 ? 0L :
+				ratio >= (decimal)long.MaxValue / primaryCount ? long.MaxValue :
+				(long)decimal.Floor(primaryCount * ratio);
+			var secondaryToSend = Math.Min(share, ratioLimit);
+			if (secondaryToSend < minimum) {
+				DoLog(LogLevel.Warning, $"Unable to prepare expedition: shared {secondaryShip} amount {secondaryToSend} is below MinSecondaryToSend {minimum}.");
+				return new Ships();
+			}
+			fleet.Add(secondaryShip, secondaryToSend);
+			return fleet;
 		}
 
 		private async Task<Ships> RefreshExpeditionShips(Celestial origin) {
@@ -385,7 +436,11 @@ namespace Tbot.Workers {
 					}
 
 					try {
-						fleet = BuildExpeditionFleet(origin, lfBonuses);
+						var pendingDispatches = Math.Min(remaining, Math.Min(
+							_tbotInstance.UserData.slots.ExpFree,
+							_tbotInstance.UserData.slots.Free - (int)_tbotInstance.InstanceSettings.General.SlotsToLeaveFree));
+						var pendingFromOrigin = dispatchPlanner.CountPendingDispatches(originIndex.Value, pendingDispatches);
+						fleet = BuildExpeditionFleet(origin, lfBonuses, pendingFromOrigin);
 					} catch (OperationCanceledException) when (_ct.IsCancellationRequested) {
 						throw;
 					} catch (Exception e) {
