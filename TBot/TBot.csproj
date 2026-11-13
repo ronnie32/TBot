@@ -5,15 +5,15 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>disable</Nullable>
     <Authors>TBot</Authors>
-		<Version>3.6.0-beta2</Version>
+		<Version>3.6.0-beta3</Version>
     <StartupObject>Tbot.Program</StartupObject>
     <Platforms>AnyCPU;x64;x86</Platforms>
     <Copyright>2026 © TBot</Copyright>
     <PackageLicenseExpression>https://licenses.nuget.org/MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://www.ogame-tbot.net</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ogame-tbot/TBot</RepositoryUrl>
-		<AssemblyVersion>3.6.0.2</AssemblyVersion>
-		<FileVersion>3.6.0.2</FileVersion>
+		<AssemblyVersion>3.6.0.3</AssemblyVersion>
+		<FileVersion>3.6.0.3</FileVersion>
     <Description>OGame Bot</Description>
     <SignAssembly>False</SignAssembly>
     <AssemblyOriginatorKeyFile>ELK-Lab.pfx</AssemblyOriginatorKeyFile>

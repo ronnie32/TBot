@@ -153,6 +153,11 @@ namespace Tbot.Workers {
                                return;
                             }
 		public async Task AutoFleetSave(Celestial celestial, bool isSleepTimeFleetSave = false, long minDuration = 0, bool WaitFleetsReturn = false, Missions TelegramMission = Missions.None, bool fromTelegram = false, bool saveall = false) {
+            await AutoFleetSaveCore(celestial, isSleepTimeFleetSave, minDuration, WaitFleetsReturn, TelegramMission, fromTelegram, saveall);
+        }
+        public Task<int> AutoFleetSaveWithResult(Celestial celestial, long minDuration) =>
+            AutoFleetSaveCore(celestial, false, minDuration, false, Missions.None, false, false);
+		private async Task<int> AutoFleetSaveCore(Celestial celestial, bool isSleepTimeFleetSave = false, long minDuration = 0, bool WaitFleetsReturn = false, Missions TelegramMission = Missions.None, bool fromTelegram = false, bool saveall = false) {
 			DateTime departureTime = await _tbotOgameBridge.GetDateTime();
 			_tbotInstance.SleepDuration = minDuration;
 
@@ -202,7 +207,7 @@ namespace Tbot.Workers {
 					_tbotInstance.log(LogLevel.Information, LogSender.SleepMode, $"Fleets active, Next check at {TimeToGhost.ToString()}");
 					await _tbotInstance.SendTelegramMessage($"Waiting for fleets return, delaying ghosting at {TimeToGhost.ToString()}");
 
-					return;
+					return 0;
 				} else if (interval == 0 && (!TryGetTimer("GhostSleepTimer", out Timer value2))) {
 
 					_tbotInstance.log(LogLevel.Information, LogSender.SleepMode, $"No fleets active, Ghosting now.");
@@ -212,10 +217,10 @@ namespace Tbot.Workers {
 					else
 						GhostandSleepAfterFleetsReturn(null);
 
-					return;
+					return 0;
 				} else if (TryGetTimer("GhostSleepTimer", out Timer value3)) {
 					await _tbotInstance.SendTelegramMessage($"GhostSleep already planned, try /cancelghostsleep");
-					return;
+					return 0;
 				}
 			}
 
@@ -224,7 +229,7 @@ namespace Tbot.Workers {
 				_tbotInstance.log(LogLevel.Warning, LogSender.FleetScheduler, $"Skipping fleetsave from {celestial.ToString()}: there is no fleet to save!");
 				if (fromTelegram)
 					await _tbotInstance.SendTelegramMessage($"{celestial.ToString()}: there is no fleet!");
-				return;
+				return 0;
 			}
 
 			celestial = await _tbotOgameBridge.UpdatePlanet(celestial, UpdateTypes.Resources);
@@ -234,7 +239,7 @@ namespace Tbot.Workers {
 				_tbotInstance.log(LogLevel.Warning, LogSender.FleetScheduler, $"Skipping fleetsave from {celestial.ToString()}: there is no fuel!");
 				if (fromTelegram)
 					await _tbotInstance.SendTelegramMessage($"{celestial.ToString()}: there is no fuel!");
-				return;
+				return 0;
 			}
 
 			long maxDeuterium = celestial.Resources.Deuterium;
@@ -246,7 +251,7 @@ namespace Tbot.Workers {
 					minDuration = (long) wakeUp.Subtract(departureTime).TotalSeconds;
 				} else {
 					_tbotInstance.log(LogLevel.Warning, LogSender.FleetScheduler, $"Could not plan fleetsave from {celestial.ToString()}: unable to parse comeback time");
-					return;
+					return 0;
 				}
 			}
 
@@ -289,10 +294,10 @@ namespace Tbot.Workers {
 
 			if (fromTelegram && !AlreadySent && mission == Missions.Harvest && fleetHypotesis.Count() == 0) {
 				await _tbotInstance.SendTelegramMessage($"No debris field found for {mission}, try to /spycrash.");
-				return;
+				return 0;
 			} else if (fromTelegram && !AlreadySent && fleetHypotesis.Count() >= 0) {
 				await _tbotInstance.SendTelegramMessage($"Available fuel: {celestial.Resources.Deuterium}\nNo destination found for {mission}, try to reduce ghost time.");
-				return;
+				return 0;
 			}
 
 			if (!AlreadySent) {
@@ -400,7 +405,7 @@ namespace Tbot.Workers {
 			if (!AlreadySent) {
 				_tbotInstance.log(LogLevel.Warning, LogSender.FleetScheduler, $"Fleetsave from {celestial.Coordinate.ToString()} no suitable destination found, you gonna get hit!");
 				await _tbotInstance.SendTelegramMessage($"Fleetsave from {celestial.Coordinate.ToString()} No destination found!, you gonna get hit!");
-				return;
+				return 0;
 			}
 
 
@@ -410,7 +415,7 @@ namespace Tbot.Workers {
     if (fleetId > 0)
     {
         Fleet fleet = _tbotInstance.UserData.fleets.SingleOrDefault(f => f.ID == fleetId);
-if (fleet == null) return;
+if (fleet == null) return 0;
         DateTime time = await _tbotOgameBridge.GetDateTime();
         var interval = ((minDuration / 2) * 1000) + RandomizeHelper.CalcRandomInterval(IntervalType.AMinuteOrTwo);
 
@@ -440,7 +445,8 @@ if (fleet == null) return;
                 $"Fleet {fleetId} send to {possibleFleet.Mission} on {possibleFleet.Destination}, arrive at {possibleFleet.Duration}, returned at {returntime} fuel consumed: {possibleFleet.Fuel.ToString("#,#", CultureInfo.InvariantCulture)}");
     }
 }
-		}
+            return fleetId > 0 ? fleetId : 0;
+        }
 		public Task<int> SendFleet(Celestial origin, Ships ships, Coordinate destination, Missions mission, decimal speed, Resources payload = null, CharacterClass playerClass = CharacterClass.NoClass, bool force = false) {
 			return DispatchFleet(origin, ships, destination, mission, speed, payload, playerClass, force, validateShips: false, reduceExpeditionPayload: false);
 		}
@@ -665,6 +671,7 @@ if (fleet == null) return;
 
 			if (validateShips) {
 				var latestShips = await _ogameService.GetShips(origin);
+                AutoFarmCargoDiagnostics.Write(_tbotInstance, "scheduler-api-stock", origin, new { Api = latestShips, Requested = ships, Mission = mission.ToString() });
 				if (latestShips == null || !latestShips.HasAtLeast(ships, 1)) {
 					_tbotInstance.log(LogLevel.Warning, LogSender.FleetScheduler,
 						$"Unable to send fleet from {origin.Coordinate}: the requested ships are no longer available.");
@@ -799,7 +806,11 @@ if (fleet == null) return;
 							"Fleet dispatch constraints changed after validation; no fleet sent.");
 						return (int) SendFleetCode.GenericError;
 					}
-					Fleet newFleet = await _ogameService.SendFleet(origin, ships, destination, mission, speed, payload);
+					if (AutoFarmCargoDiagnostics.BlocksDispatch(_tbotInstance)) {
+                        AutoFarmCargoDiagnostics.Write(_tbotInstance, "dispatch-blocked", origin, new { Mission = mission.ToString(), Ships = ships, Reason = "CargoDiagnostics.BlockFleetDispatch" });
+                        return (int) SendFleetCode.GenericError;
+                    }
+                    Fleet newFleet = await _ogameService.SendFleet(origin, ships, destination, mission, speed, payload);
 					if (newFleet == null) {
 						_tbotInstance.log(LogLevel.Warning, LogSender.FleetScheduler, $"Unable to send fleet from {origin.Coordinate.ToString()}: no ships to send.");
 						return (int) SendFleetCode.GenericError;

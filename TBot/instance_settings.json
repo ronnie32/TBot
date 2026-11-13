@@ -83,6 +83,7 @@
 			"MinResourcesToSave": 2000000,
 			"MinFleetToSave": 20000000
 		},
+		"UseCurrentCelestial": true,
 		"RandomActivity": true,
 		"Home": {
 			"Galaxy": 1,
@@ -91,7 +92,12 @@
 			"Type": "Planet"
 		},
 		"Autofleet": {
-			"Active": true,
+            "Active": true,
+            "DelayedFleetSave": {
+                "Active": false,
+                "DelaySeconds": 120,
+                "SafetySeconds": 120
+            },
 			"TelegramMessenger": {
 				"Active": false
 			}
@@ -445,6 +451,7 @@
 		]
 	},
 	"AutoFarm": {
+		"CargoDiagnostics": { "Active": false, "BlockFleetDispatch": true },
 		"Active": false,
 		"ExcludeMoons": true,
 		"ScanRange": [

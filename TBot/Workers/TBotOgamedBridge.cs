@@ -67,7 +67,10 @@ namespace Tbot.Workers
 						planet.LFBonuses = await ogameService.GetLFBonuses();
 						break;
 					case UpdateTypes.Ships:
-						planet.Ships = await ogameService.GetShips(planet);
+                        var cachedShips = planet.Ships;
+                        AutoFarmCargoDiagnostics.Write(_tbotInstance, "refresh-start", planet, new { Cached = cachedShips });
+                        planet.Ships = await ogameService.GetShips(planet);
+                        AutoFarmCargoDiagnostics.Write(_tbotInstance, "api-stock", planet, new { Cached = cachedShips, Api = planet.Ships });
 						break;
 					case UpdateTypes.Facilities:
 						planet.Facilities = await ogameService.GetFacilities(planet);
@@ -121,7 +124,8 @@ namespace Tbot.Workers
 						break;
 				}
 			} catch (Exception e) {
-				_tbotInstance.log(LogLevel.Debug, LogSender.Tbot, $"Exception: {e.Message}");
+                AutoFarmCargoDiagnostics.Write(_tbotInstance, "refresh-failed-cached-stock-retained", planet, new { Update = UpdateTypes.ToString(), ErrorType = e.GetType().Name, Retained = planet.Ships });
+                _tbotInstance.log(LogLevel.Debug, LogSender.Tbot, $"Exception: {e.Message}");
 				_tbotInstance.log(LogLevel.Warning, LogSender.Tbot, $"Stacktrace: {e.StackTrace}");
 				_tbotInstance.log(LogLevel.Warning, LogSender.Tbot, $"An error has occurred with update {UpdateTypes.ToString()}. Skipping update");
 			}

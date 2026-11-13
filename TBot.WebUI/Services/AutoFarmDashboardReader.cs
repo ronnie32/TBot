@@ -121,7 +121,7 @@ ORDER BY observed_at_utc DESC;";
 
 		private static void ReadTargets(SqliteConnection connection, AutoFarmDashboardStorage storage, string instanceAlias, List<LogRecord> logs) {
 			var blacklist = ReadBlacklist(instanceAlias);
-			var logReasons = BuildTargetReasons(logs);
+			var logReasons = BuildTargetReasons(logs, instanceAlias);
 			var consumedReportIds = ReadConsumedReportIds(connection);
 			var processedReportOutcomes = ReadProcessedReportOutcomes(connection);
 			using var command = connection.CreateCommand();
@@ -383,36 +383,32 @@ WHERE id = 1;";
 			}).ToList();
 		}
 
-		private static Dictionary<string, string> BuildTargetReasons(List<LogRecord> logs) {
-			var reasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-			string? currentAttackTarget = null;
-			foreach (var log in logs.Where(log => log.Sender.Equals("AutoFarm", StringComparison.OrdinalIgnoreCase))) {
-				var coordinate = ExtractCoordinate(log.Message);
-				if (log.Message.Contains("Attacking target", StringComparison.OrdinalIgnoreCase) && coordinate != null)
-					currentAttackTarget = coordinate;
-
-				if (currentAttackTarget != null && log.Message.Contains("Insufficient", StringComparison.OrdinalIgnoreCase)) {
-					var cargo = RequiredCargo.Match(log.Message);
-					reasons[currentAttackTarget] = cargo.Success
-						? $"Blocked: {cargo.Groups["amount"].Value.Trim()} {cargo.Groups["ship"].Value} required"
-						: "Blocked: insufficient fleet capacity";
-				}
-
-				if (log.Message.Contains("Ignoring previously handled non-actionable espionage report", StringComparison.OrdinalIgnoreCase) && coordinate != null)
-					reasons[coordinate] = "Report already processed";
-
-				if (coordinate != null && log.Message.Contains("No origin celestial available", StringComparison.OrdinalIgnoreCase))
-					reasons[coordinate] = "No suitable origin";
-
-				if (coordinate != null && log.Message.Contains("Attack dispatch failed", StringComparison.OrdinalIgnoreCase))
-					reasons[coordinate] = "Attack dispatch failed";
-			}
-			return reasons;
-		}
+        private static Dictionary<string, string> BuildTargetReasons(List<LogRecord> logs, string instanceAlias) {
+            var reasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var log in logs.Where(log => log.Sender.Equals("AutoFarm", StringComparison.OrdinalIgnoreCase))) {
+                var instance = Regex.Match(log.Message, @"\binstance=(?<alias>""(?:\\.|[^""\\])*"")");
+                if (!instance.Success || JToken.Parse(instance.Groups["alias"].Value).Value<string>() != instanceAlias) continue;
+                var target = Regex.Match(log.Message, @"\bTarget (?<coord>\[[MP]:\d+:\d+:\d+\])");
+                var coordinate = target.Success ? target.Groups["coord"].Value : null;
+                var report = Regex.Match(log.Message, @"\breport=(?<id>\d+)\b");
+                // A coordinate or the last global log alone cannot identify a report.
+                if (coordinate == null || !report.Success) continue;
+                string reason = log.Message.Contains("Cargo minimum not met", StringComparison.OrdinalIgnoreCase)
+                    ? "Target cargo requirement below MinCargosToSend"
+                    : log.Message.Contains("Cargo stock empty", StringComparison.OrdinalIgnoreCase)
+                    ? "No cargo ships read at origin"
+                    : log.Message.Contains("Cargo reserve blocks dispatch", StringComparison.OrdinalIgnoreCase)
+                    ? "Cargo stock reserved by MinCargosToKeep"
+                    : log.Message.Contains("Cargo stock below minimum", StringComparison.OrdinalIgnoreCase)
+                    ? "Available cargo stock below MinCargosToSend" : null;
+                if (reason != null) reasons[coordinate + "#" + report.Groups["id"].Value] = reason;
+            }
+            return reasons;
+        }
 
 		private static (string Label, string Detail) ResolveTargetReason(string state, string coordinate, int reportId, int? consumedReportId, ISet<int> consumedReportIds, IReadOnlyDictionary<int, string> processedReportOutcomes, Dictionary<string, BlacklistEntry> blacklist, Dictionary<string, string> logReasons) {
-			if (logReasons.TryGetValue(coordinate, out var loggedReason))
-				return (loggedReason, "Taken from the latest AutoFarm log");
+			if (state == "AttackPending" && logReasons.TryGetValue(coordinate + "#" + reportId, out var loggedReason))
+				return (loggedReason, "Recorded for this report in the AutoFarm log");
 			if (state == "AttackSent")
 				return ("Attack sent", "Fleet dispatch was recorded");
 			if (reportId > 0 && processedReportOutcomes.TryGetValue(reportId, out var processedOutcome) &&

@@ -18,6 +18,19 @@ using Newtonsoft.Json;
 
 namespace Tbot.Workers {
 	public class AutoFarmWorker : WorkerBase {
+        private void LogCargoRejection(FarmTarget target, Buildables cargoShip, Celestial origin, long needed, long available, long final) {
+            var stock = origin.Ships?.GetAmount(cargoShip) ?? 0;
+            var minimum = (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToSend;
+            var keep = (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep;
+            var reason = needed < minimum
+                ? "Cargo minimum not met: target requires fewer ships than MinCargosToSend"
+                : stock == 0 ? "Cargo stock empty: no ships read at origin"
+                : available <= 0 ? "Cargo reserve blocks dispatch: stock is reserved by MinCargosToKeep"
+                : "Cargo stock below minimum after MinCargosToKeep";
+            _tbotInstance.log(LogLevel.Information, LogSender.AutoFarm,
+                $"{reason}. Target {target.Celestial.Coordinate}, report={target.Report.ID}, instance={JsonConvert.SerializeObject(_tbotInstance.InstanceAlias)}, origin={origin}, cargo={cargoShip}, stock={stock}, keep={keep}, needed={needed}, final={final}, minimum={minimum}. Skipping target.");
+        }
+
 		private readonly IOgameService _ogameService;
 		private readonly IFleetScheduler _fleetScheduler;
 		private readonly ICalculationService _calculationService;
@@ -1163,7 +1176,7 @@ namespace Tbot.Workers {
 
 									if (celestialProbes[bestOrigin.Origin.ID] < neededProbes) {
 										_tbotInstance.log(LogLevel.Warning, LogSender.AutoFarm, $"Insufficient probes ({celestialProbes[bestOrigin.Origin.ID]}/{neededProbes}).");
-										if (SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "BuildProbes") && _tbotInstance.InstanceSettings.AutoFarm.BuildProbes == true) {
+										if (!AutoFarmCargoDiagnostics.BlocksDispatch(_tbotInstance) && SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "BuildProbes") && _tbotInstance.InstanceSettings.AutoFarm.BuildProbes == true) {
 
 											var tempCelestial = await _tbotOgameBridge.UpdatePlanet(bestOrigin.Origin, UpdateTypes.Constructions);
 											if (tempCelestial.Constructions.BuildingID == (int) Buildables.Shipyard || tempCelestial.Constructions.BuildingID == (int) Buildables.NaniteFactory) {
@@ -1481,6 +1494,7 @@ namespace Tbot.Workers {
 							tempCelestial = await _tbotOgameBridge.UpdatePlanet(tempCelestial, UpdateTypes.LFBonuses);
 							var candidateCargo = CalculateFarmCargoCount(loot, cargoShip, tempCelestial.LFBonuses);
 							var candidateShips = BuildAttackFleet(candidateCargo, cargoShip, target.Report);
+                            AutoFarmCargoDiagnostics.Write(_tbotInstance, "origin-candidate", tempCelestial, new { ReportId = target.Report.ID, CargoType = cargoShip.ToString(), Stock = tempCelestial.Ships?.GetAmount(cargoShip), Needed = candidateCargo, Keep = (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep, Minimum = (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToSend });
 							if (tempCelestial.Ships != null &&
 								tempCelestial.Ships.GetAmount(cargoShip) >= candidateCargo + (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep &&
 								tempCelestial.Ships.HasAtLeast(candidateShips)) {
@@ -1567,7 +1581,7 @@ namespace Tbot.Workers {
 									}
 								}
 								if ((tempCelestial.Ships?.GetAmount(cargoShip) ?? 0) < candidateCargo + (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep) {
-									if (SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "BuildCargos") && _tbotInstance.InstanceSettings.AutoFarm.BuildCargos == true) {
+									if (!AutoFarmCargoDiagnostics.BlocksDispatch(_tbotInstance) && SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.AutoFarm, "BuildCargos") && _tbotInstance.InstanceSettings.AutoFarm.BuildCargos == true) {
 										var neededCargos = candidateCargo + (long) _tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep - tempCelestial.Ships.GetAmount(cargoShip);
 										var cost = _calculationService.CalcPrice(cargoShip, (int) neededCargos);
 										if (tempCelestial.Resources.IsEnoughFor(cost)) {
@@ -1595,7 +1609,7 @@ namespace Tbot.Workers {
 									var availableCargo = (tempCelestial.Ships?.GetAmount(cargoShip) ?? 0) - (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep;
 									var actualCargo = Math.Min(Math.Max(0, availableCargo), candidateCargo);
 									if (actualCargo < (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToSend) {
-										_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, $"Insufficient {cargoShip.ToString()} on {tempCelestial.Coordinate}, require {candidateCargo + (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep} {cargoShip.ToString()}.");
+										LogCargoRejection(target, cargoShip, tempCelestial, candidateCargo, availableCargo, actualCargo);
 										continue;
 									}
 
@@ -1680,8 +1694,9 @@ namespace Tbot.Workers {
 							}
 							var availableShips = (fromCelestial.Ships?.GetAmount(cargoShip) ?? 0) - (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep;
 							var finalCargo = Math.Min(Math.Max(0, availableShips), numCargo);
+                            AutoFarmCargoDiagnostics.Write(_tbotInstance, "final-cargo", fromCelestial, new { ReportId = target.Report.ID, CargoType = cargoShip.ToString(), Stock = fromCelestial.Ships?.GetAmount(cargoShip), Keep = (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToKeep, Minimum = (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToSend, Needed = numCargo, Available = availableShips, Final = finalCargo, FreeSlots = slotBudget.AvailableSlots, Fleets = _tbotInstance.UserData.fleets?.Select(f => new { f.ID, f.Mission, f.ReturnFlight, f.Origin, f.Ships }).ToArray() });
 							if (finalCargo < (long)_tbotInstance.InstanceSettings.AutoFarm.MinCargosToSend) {
-								_tbotInstance.log(LogLevel.Information, LogSender.AutoFarm, $"No {cargoShip.ToString()} available on {fromCelestial.ToString()} (all ships already in use). Skipping target.");
+								LogCargoRejection(target, cargoShip, fromCelestial, numCargo, availableShips, finalCargo);
 								continue;
 							}
 							if (finalCargo < numCargo)
@@ -1846,7 +1861,11 @@ namespace Tbot.Workers {
 		}
 
 		private async Task<bool> TryDeleteEspionageReport(int reportId, string reason) {
-			if (GetCombatSettings().ObservationOnly) return false;
+			if (AutoFarmCargoDiagnostics.BlocksDispatch(_tbotInstance)) {
+                AutoFarmCargoDiagnostics.Write(_tbotInstance, "report-delete-blocked", null, new { ReportId = reportId, Reason = reason });
+                return true; // Continue processing locally; preserve the server report for diagnosis.
+            }
+            if (GetCombatSettings().ObservationOnly) return false;
 			if (reportId <= 0)
 				return false;
 

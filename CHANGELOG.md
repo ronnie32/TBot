@@ -1,5 +1,25 @@
 # Changelog
 
+## v3.6.0-beta3
+
+> **Beta warning:** Safe and Balanced remain experimental and can lose ships. User feedback is needed.
+
+### Added
+
+#### Defender
+
+- Routine attack checks no longer force a switch away from the player's selected celestial.
+- Added optional delayed fleetsave with immediate alerts and a configurable pre-impact safety margin. Disabled by default.
+
+### Fixed
+
+#### AutoFarm
+
+- Distinguish cargo minimum and reserve settings from an actual ship shortage in logs and the dashboard.
+
+Build version: **3.6.0.3**
+Release channel: **Beta**
+
 ## v3.6.0-beta2
 
 > **Beta warning:** Safe and Balanced are experimental and can lose ships. Start in observation-only mode. User feedback is needed.

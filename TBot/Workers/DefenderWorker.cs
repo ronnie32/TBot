@@ -19,7 +19,12 @@ using Tbot.Common.Settings;
 
 namespace Tbot.Workers {
 	internal class DefenderWorker : WorkerBase {
-		private static readonly ConcurrentDictionary<int, DateTime> _handledAttackIds = new();
+		private readonly ConcurrentDictionary<int, DateTime> _handledAttackIds = new();
+        private readonly HashSet<int> _notifiedAttackIds = new();
+        private readonly Dictionary<int, DateTime> _pendingSaves = new();
+        private bool UseCurrentCelestial => !SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.Defender, "UseCurrentCelestial") || (bool)_tbotInstance.InstanceSettings.Defender.UseCurrentCelestial;
+        private bool DelayEnabled => SettingsService.IsSettingSet(_tbotInstance.InstanceSettings.Defender.Autofleet, "DelayedFleetSave") &&
+            (bool)_tbotInstance.InstanceSettings.Defender.Autofleet.DelayedFleetSave.Active;
 		private static readonly TimeSpan _handledAttackTtl = TimeSpan.FromMinutes(60);
 
 		private readonly IFleetScheduler _fleetScheduler;
@@ -39,17 +44,30 @@ namespace Tbot.Workers {
 			try {
 				DoLog(LogLevel.Information, "Checking attacks...");
 
-				await FakeActivity();
-				_tbotInstance.UserData.fleets = await _fleetScheduler.UpdateFleets();
-				bool isUnderAttack = await _ogameService.IsUnderAttack();
-				DateTime time = await _tbotOgameBridge.GetDateTime();
+				if (!UseCurrentCelestial) {
+                    await FakeActivity();
+                    _tbotInstance.UserData.fleets = await _fleetScheduler.UpdateFleets();
+                }
+                // The empire-wide event list needs no cp parameter. Do not navigate to
+                // Home/a random origin or restore a stale selection over the player's click.
+                DateTime time = (await _ogameService.GetServerTime()).ToUniversalTime();
+                _tbotInstance.UserData.attacks = await _ogameService.GetAttacks()
+                    ?? throw new InvalidOperationException("OGame returned no attack snapshot.");
+                var activeIds = _tbotInstance.UserData.attacks.Select(a => a.ID).ToHashSet();
+                foreach (var id in _pendingSaves.Keys.Where(id => !activeIds.Contains(id)).ToArray()) {
+                    _pendingSaves.Remove(id);
+                    _notifiedAttackIds.Remove(id);
+                    DoLog(LogLevel.Information, $"Delayed fleetsave cancelled: attack {id} is no longer present.");
+                }
+                _notifiedAttackIds.RemoveWhere(id => !activeIds.Contains(id));
+                bool isUnderAttack = _tbotInstance.UserData.attacks.Count > 0;
 				if (isUnderAttack) {
 					if ((bool) _tbotInstance.InstanceSettings.Defender.Alarm.Active)
 						await Task.Run(() => ConsoleHelpers.PlayAlarm(), _ct);
 					DoLog(LogLevel.Warning, "ENEMY ACTIVITY!!!");
-					_tbotInstance.UserData.attacks = await _ogameService.GetAttacks();
-					foreach (AttackerFleet attack in _tbotInstance.UserData.attacks) {
-						await HandleAttack(attack);
+					foreach (AttackerFleet attack in _tbotInstance.UserData.attacks.OrderBy(a => a.ArriveIn)) {
+                        _ct.ThrowIfCancellationRequested();
+                        await HandleAttack(attack);
 					}
 				} else {
 					DoLog(LogLevel.Information, "Your empire is safe");
@@ -58,19 +76,21 @@ namespace Tbot.Workers {
 				if (interval <= 0)
 					interval = RandomizeHelper.CalcRandomInterval(IntervalType.SomeSeconds);
 
-				DateTime newTime = time.AddMilliseconds(interval);
+				time = (await _ogameService.GetServerTime()).ToUniversalTime();
+                interval = BoundCheckInterval(interval, time);
+                DateTime newTime = time.AddMilliseconds(interval);
 				ChangeWorkerPeriod(TimeSpan.FromMilliseconds(interval));
 				DoLog(LogLevel.Information, $"Next check at {newTime.ToString()}");
-				await _tbotOgameBridge.CheckCelestials();
+				if (!UseCurrentCelestial) await _tbotOgameBridge.CheckCelestials();
 			} catch (Exception e) {
 				DoLog(LogLevel.Warning, $"An error has occurred while checking for attacks: {e.Message}");
 				DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
-				DateTime time = await _tbotOgameBridge.GetDateTime();
-				long interval = RandomizeHelper.CalcRandomInterval(IntervalType.AFewSeconds);
+				DateTime time = DateTime.UtcNow; // Local retry time only, never used to plan an impact.
+                long interval = _pendingSaves.Count > 0 ? 5000 : RandomizeHelper.CalcRandomInterval(IntervalType.AFewSeconds);
 				DateTime newTime = time.AddMilliseconds(interval);
 				ChangeWorkerPeriod(TimeSpan.FromMilliseconds(interval));
 				DoLog(LogLevel.Information, $"Next check at {newTime.ToString()}");
-				await _tbotOgameBridge.CheckCelestials();
+				if (!UseCurrentCelestial) await _tbotOgameBridge.CheckCelestials();
 			} finally {
 
 			}
@@ -137,9 +157,11 @@ namespace Tbot.Workers {
 					DoLog(LogLevel.Information, $"Attack {attack.ID} already handled recently; skipping duplicate actions.");
 					return;
 				}
-				if (attack != null && attack.ID != 0) {
-					_handledAttackIds[attack.ID] = nowUtc;
-				}
+				if (attack == null || attack.ID <= 0) throw new InvalidOperationException("Attack has no valid ID.");
+                if (_pendingSaves.ContainsKey(attack.ID)) {
+                    await TryPendingFleetSave(attack);
+                    return;
+                }
 
 			if (_tbotInstance.UserData.celestials.Count() == 0) {
 				DateTime time = await _tbotOgameBridge.GetDateTime();
@@ -272,6 +294,7 @@ namespace Tbot.Workers {
 				DoLog(LogLevel.Warning, "An error has occurred while checking attacker fleet composition");
 			}
 
+            if (_notifiedAttackIds.Add(attack.ID)) {
 			await _tbotInstance.SendFeatureNotification(_tbotInstance.InstanceSettings.Defender,
 				$"Player {attack.AttackerName} ({attack.AttackerID}) is attacking your planet {attack.Destination.ToString()} arriving at {attack.ArrivalTime.ToString()}",
 				NotificationKind.Attack);
@@ -332,19 +355,85 @@ namespace Tbot.Workers {
 				}
 			}
 
-			if ((bool) _tbotInstance.InstanceSettings.Defender.Autofleet.Active) {
-				try {
-					var minFlightTime = attack.ArriveIn + (attack.ArriveIn / 100 * 30) + (RandomizeHelper.CalcRandomInterval(IntervalType.SomeSeconds) / 1000);
-					await _fleetScheduler.AutoFleetSave(attackedCelestial, false, minFlightTime);
-				} catch (Exception e) {
-					DoLog(LogLevel.Error, $"Could not fleetsave: an exception has occurred: {e.Message}");
-					DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
-				}
-			}
+            }
+            if ((bool)_tbotInstance.InstanceSettings.Defender.Autofleet.Active) {
+                var now = (await _ogameService.GetServerTime()).ToUniversalTime();
+                var due = now;
+                if (DelayEnabled) {
+                    var delay = ReadDelaySeconds("DelaySeconds", 0, 86400);
+                    var safety = ReadDelaySeconds("SafetySeconds", 1, 3600);
+                    due = new[] { now.AddSeconds(delay), AttackArrival(attack, now).AddSeconds(-safety) }.Min();
+                }
+                _pendingSaves[attack.ID] = due;
+                if (due > now) {
+                    DoLog(LogLevel.Warning, $"Fleetsave scheduled for attack {attack.ID} on {attack.Destination} at {due:O}; attack will be rechecked before dispatch.");
+                    await _tbotInstance.SendFeatureNotification(_tbotInstance.InstanceSettings.Defender,
+                        $"Fleetsave scheduled on {attack.Destination} at {due:O}. You can move the fleet yourself; the bot will recheck the attack and ships before sending.", NotificationKind.Attack);
+                } else await TryPendingFleetSave(attack);
+            }
 			} catch (Exception e) {
 				DoLog(LogLevel.Error, $"HandleAttack error for attack {attack?.ID}: {e.Message}");
 				DoLog(LogLevel.Warning, $"Stacktrace: {e.StackTrace}");
 			}
 		}
+        private int ReadDelaySeconds(string field, int min, int max) {
+            var value = (int)_tbotInstance.InstanceSettings.Defender.Autofleet.DelayedFleetSave[field];
+            if (value < min || value > max) throw new InvalidOperationException($"Defender.Autofleet.DelayedFleetSave.{field} must be between {min} and {max} seconds.");
+            return value;
+        }
+
+        private static DateTime AttackArrival(AttackerFleet attack, DateTime now) {
+            if (attack.ArrivalTime == default || attack.ArriveIn <= 0)
+                throw new InvalidOperationException($"Attack {attack.ID} has no future arrival time; fleetsave was not scheduled.");
+            return new[] { attack.ArrivalTime.ToUniversalTime(), now.AddSeconds(attack.ArriveIn) }.Min();
+        }
+
+        private long BoundCheckInterval(long interval, DateTime now) {
+            if (_pendingSaves.Count == 0) return interval;
+            var nextDue = _pendingSaves.Values.Min();
+            return Math.Min(interval, nextDue <= now ? 5000 : Math.Max(1000, (long)(nextDue - now).TotalMilliseconds));
+        }
+
+        private async Task TryPendingFleetSave(AttackerFleet attack) {
+            if (!(bool)_tbotInstance.InstanceSettings.Defender.Autofleet.Active) {
+                _pendingSaves.Remove(attack.ID);
+                DoLog(LogLevel.Information, $"Delayed fleetsave cancelled for attack {attack.ID}: Defender.Autofleet.Active is false.");
+                return;
+            }
+            var now = (await _ogameService.GetServerTime()).ToUniversalTime();
+            var arrival = AttackArrival(attack, now);
+            if (arrival <= now) {
+                _pendingSaves.Remove(attack.ID);
+                DoLog(LogLevel.Error, $"Attack {attack.ID} arrival has passed; no fleetsave sent for this expired event.");
+                return;
+            }
+            var deadline = DelayEnabled ? arrival.AddSeconds(-ReadDelaySeconds("SafetySeconds", 1, 3600)) : now;
+            var due = new[] { _pendingSaves[attack.ID], deadline }.Min();
+            _pendingSaves[attack.ID] = due;
+            if (due > now) return;
+            _ct.ThrowIfCancellationRequested();
+            var origin = _tbotInstance.UserData.celestials.Unique().FirstOrDefault(c => c.HasCoords(attack.Destination))
+                ?? throw new InvalidOperationException($"Cannot fleetsave attack {attack.ID}: origin {attack.Destination} missing.");
+            // Do not use UpdatePlanet here: its catch retains stale stock after an API error.
+            origin.Ships = await _ogameService.GetShips(origin)
+                ?? throw new InvalidOperationException("OGame returned no ships for fleetsave.");
+            if (origin.Ships.GetMovableShips().IsEmpty()) {
+                _pendingSaves.Remove(attack.ID);
+                _handledAttackIds[attack.ID] = DateTime.UtcNow;
+                DoLog(LogLevel.Information, $"Delayed fleetsave cancelled for attack {attack.ID}: no movable ships remain on {origin.Coordinate}.");
+                return;
+            }
+            var remaining = Math.Max(1L, (long)Math.Ceiling((arrival - now).TotalSeconds));
+            var fleetId = await _fleetScheduler.AutoFleetSaveWithResult(origin, remaining + remaining * 30 / 100 + 30);
+            if (fleetId > 0) {
+                _pendingSaves.Remove(attack.ID);
+                _handledAttackIds[attack.ID] = DateTime.UtcNow;
+                DoLog(LogLevel.Information, $"Fleetsave dispatch confirmed for attack {attack.ID} from {origin.Coordinate}, fleet={fleetId}.");
+            } else {
+                // Keep the original deadline: an unsuccessful send must not restart the grace period.
+                DoLog(LogLevel.Error, $"Fleetsave dispatch not confirmed for attack {attack.ID}; retrying on the next check.");
+            }
+        }
+
 	}
 }

@@ -1,7 +1,7 @@
 param(
-    [string]$Version = '3.6.0-beta2',
-    [string]$AssemblyVersion = '3.6.0.2',
-    [string]$ReleaseName = 'release-build-3.6.0-beta2'
+    [string]$Version = '3.6.0-beta3',
+    [string]$AssemblyVersion = '3.6.0.3',
+    [string]$ReleaseName = 'release-build-3.6.0-beta3'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +54,7 @@ foreach ($platform in $platforms) {
     }
     New-Item -ItemType Directory -Path (Join-Path $packageRoot 'docs'), (Join-Path $packageRoot 'scripts') | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/autofarm-combat-planner.md') -Destination (Join-Path $packageRoot 'docs')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/defender-qol.md') -Destination (Join-Path $packageRoot 'docs')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts/compare-combat-observation.py') -Destination (Join-Path $packageRoot 'scripts')
     $null = Get-Content -LiteralPath (Join-Path $packageRoot 'settings.json') -Raw | ConvertFrom-Json
     $null = Get-Content -LiteralPath (Join-Path $packageRoot 'instance_settings.json') -Raw | ConvertFrom-Json
